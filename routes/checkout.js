@@ -180,7 +180,9 @@ router.post('/create-checkout-session', async (req, res) => {
     });
 
     const bookIds = items.map(item => item.id).join(',');
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    let origin = req.headers.origin || (req.headers.referer ? new URL(req.headers.referer).origin : null);
+    const rawFrontendUrl = process.env.FRONTEND_URL || origin || 'https://bookpatr.vercel.app';
+    const frontendUrl = rawFrontendUrl.replace(/\/$/, '');
 
     const sessionParams = {
       line_items: lineItems,
