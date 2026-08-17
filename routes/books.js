@@ -12,6 +12,7 @@ router.post('/delete-batch', bookController.deleteBatchBooks);
 
 // Delete all books
 router.delete('/all/truncate', bookController.deleteAllBooks);
+router.delete('/truncate', bookController.deleteAllBooks);
 
 // Create a new book (with file and cover image uploads)
 router.post('/', upload.fields([
