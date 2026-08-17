@@ -2,12 +2,20 @@ const supabase = require('../supabase');
 
 exports.getAllBooks = async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('books')
-      .select('*');
+    const { site, site_id } = req.query;
+    const targetSite = site || site_id;
+
+    let query = supabase.from('books').select('*');
+
+    if (targetSite && targetSite !== 'all') {
+      // Return books specifically assigned to this site, or general 'all' books
+      query = query.or(`site_id.eq.${targetSite},site_id.eq.all,site_id.is.null`);
+    }
+
+    const { data, error } = await query.order('created_at', { ascending: false });
     
     if (error) throw error;
-    res.json(data);
+    res.json(data || []);
   } catch (error) {
     console.error('Error in getAllBooks:', error);
     res.status(500).json({ error: error.message });
@@ -33,7 +41,8 @@ exports.getBookById = async (req, res) => {
 
 exports.createBook = async (req, res) => {
   try {
-    const { title, author, description, category, price, details } = req.body;
+    const { title, author, description, category, price, details, site_id, site } = req.body;
+    const targetSite = site_id || site || 'all';
     const files = req.files;
 
     let fileUrl = '';
@@ -70,6 +79,7 @@ exports.createBook = async (req, res) => {
     }
 
     const bookData = { 
+      site_id: targetSite,
       title, 
       author, 
       description, 
@@ -96,7 +106,7 @@ exports.createBook = async (req, res) => {
 exports.updateBook = async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, author, description, category, price, details } = req.body;
+    const { title, author, description, category, price, details, site_id, site } = req.body;
     const files = req.files;
 
     let updateData = {
@@ -107,6 +117,10 @@ exports.updateBook = async (req, res) => {
       price,
       details: typeof details === 'string' ? JSON.parse(details) : details
     };
+
+    if (site_id !== undefined || site !== undefined) {
+      updateData.site_id = site_id || site || 'all';
+    }
 
     // Upload new book file if exists
     if (files && files.file) {
@@ -156,8 +170,6 @@ exports.deleteBook = async (req, res) => {
   try {
     const { id } = req.params;
     
-    // Optional: Delete files from storage too
-    // For now, just delete the record
     const { error } = await supabase
       .from('books')
       .delete()
@@ -192,16 +204,24 @@ exports.deleteBatchBooks = async (req, res) => {
 
 exports.deleteAllBooks = async (req, res) => {
   try {
-    const { error } = await supabase
-      .from('books')
-      .delete()
-      .neq('id', '00000000-0000-0000-0000-000000000000');
+    const { site, site_id } = req.query;
+    const targetSite = site || site_id || (req.body && (req.body.site || req.body.site_id));
+
+    let query = supabase.from('books').delete();
+
+    if (targetSite && targetSite !== 'all') {
+      query = query.eq('site_id', targetSite);
+    } else {
+      query = query.neq('id', '00000000-0000-0000-0000-000000000000');
+    }
     
+    const { error } = await query;
     if (error) throw error;
-    res.json({ message: 'All books deleted successfully' });
+    res.json({ message: targetSite && targetSite !== 'all' ? `All books for ${targetSite} deleted successfully` : 'All books deleted successfully' });
   } catch (error) {
     console.error('Error in deleteAllBooks:', error);
     res.status(500).json({ error: error.message });
   }
 };
+
 

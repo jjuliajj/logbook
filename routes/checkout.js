@@ -3,42 +3,73 @@ const router = express.Router();
 const Stripe = require('stripe');
 const supabase = require('../supabase');
 
-// Helper to get active Stripe client dynamically from DB or fallback to .env
-async function getStripeClient() {
+// Helper to get active Stripe client dynamically from DB per site or fallback to global / .env
+async function getStripeClient(siteId) {
+  const targetSite = siteId && siteId !== 'all' ? siteId.toLowerCase().trim() : null;
+
   try {
-    const { data, error } = await supabase
+    // 1. Try to find active Stripe account configured specifically for this site
+    if (targetSite) {
+      const { data: siteData, error: siteError } = await supabase
+        .from('stripe_settings')
+        .select('*')
+        .eq('site_id', targetSite)
+        .eq('is_active', true)
+        .limit(1)
+        .maybeSingle();
+
+      if (!siteError && siteData && siteData.secret_key) {
+        return {
+          stripe: new Stripe(siteData.secret_key),
+          accountName: siteData.account_name,
+          secretKey: siteData.secret_key,
+          siteId: targetSite
+        };
+      }
+    }
+
+    // 2. Fallback to active global Stripe account (site_id = 'all' or any active)
+    const { data: globalData, error: globalError } = await supabase
       .from('stripe_settings')
       .select('*')
       .eq('is_active', true)
       .limit(1)
       .maybeSingle();
 
-    if (!error && data && data.secret_key) {
+    if (!globalError && globalData && globalData.secret_key) {
       return {
-        stripe: new Stripe(data.secret_key),
-        accountName: data.account_name,
-        secretKey: data.secret_key
+        stripe: new Stripe(globalData.secret_key),
+        accountName: globalData.account_name,
+        secretKey: globalData.secret_key,
+        siteId: globalData.site_id || 'all'
       };
     }
   } catch (err) {
     console.log('Stripe DB query fallback to env:', err.message);
   }
 
-  // Fallback to .env variable
+  // 3. Fallback to .env variable
   return {
-    stripe: new Stripe(process.env.STRIPE_SECRET_KEY),
+    stripe: new Stripe(process.env.STRIPE_SECRET_KEY || ''),
     accountName: 'Default (.env)',
-    secretKey: process.env.STRIPE_SECRET_KEY
+    secretKey: process.env.STRIPE_SECRET_KEY || '',
+    siteId: 'env'
   };
 }
 
-// 1. Get all Stripe account settings
+// 1. Get all Stripe account settings (optionally filtered by ?site=...)
 router.get('/stripe-settings', async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('stripe_settings')
-      .select('*')
-      .order('created_at', { ascending: false });
+    const { site, site_id } = req.query;
+    const targetSite = site || site_id;
+
+    let query = supabase.from('stripe_settings').select('*');
+
+    if (targetSite && targetSite !== 'all') {
+      query = query.eq('site_id', targetSite);
+    }
+
+    const { data, error } = await query.order('created_at', { ascending: false });
 
     if (error) throw error;
     res.json(data || []);
@@ -47,25 +78,28 @@ router.get('/stripe-settings', async (req, res) => {
   }
 });
 
-// 2. Add new Stripe account setting
+// 2. Add new Stripe account setting for a specific site
 router.post('/stripe-settings', async (req, res) => {
   try {
-    const { account_name, publishable_key, secret_key, is_active } = req.body;
+    const { account_name, publishable_key, secret_key, is_active, site_id, site } = req.body;
+    const targetSite = site_id || site || 'all';
+
     if (!account_name || !secret_key) {
       return res.status(400).json({ error: 'Account Name and Secret Key are required.' });
     }
 
     if (is_active) {
-      // Deactivate all others first
+      // Deactivate only other accounts for the SAME site_id
       await supabase
         .from('stripe_settings')
         .update({ is_active: false })
-        .neq('id', '00000000-0000-0000-0000-000000000000');
+        .eq('site_id', targetSite);
     }
 
     const { data, error } = await supabase
       .from('stripe_settings')
       .insert([{
+        site_id: targetSite,
         account_name,
         publishable_key: publishable_key || '',
         secret_key,
@@ -80,16 +114,27 @@ router.post('/stripe-settings', async (req, res) => {
   }
 });
 
-// 3. Activate a Stripe account
+// 3. Activate a Stripe account (deactivates other accounts for the same site)
 router.put('/stripe-settings/:id/activate', async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Deactivate all accounts
+    // Get the target record first to know its site_id
+    const { data: targetRecord, error: getError } = await supabase
+      .from('stripe_settings')
+      .select('site_id')
+      .eq('id', id)
+      .single();
+
+    if (getError || !targetRecord) throw new Error('Stripe setting not found');
+
+    const targetSite = targetRecord.site_id || 'all';
+
+    // Deactivate all accounts for the SAME site_id
     await supabase
       .from('stripe_settings')
       .update({ is_active: false })
-      .neq('id', '00000000-0000-0000-0000-000000000000');
+      .eq('site_id', targetSite);
 
     // Activate selected account
     const { data, error } = await supabase
@@ -105,24 +150,26 @@ router.put('/stripe-settings/:id/activate', async (req, res) => {
   }
 });
 
-// 3b. Update a Stripe account configuration (name, keys, active state)
+// 3b. Update a Stripe account configuration (name, keys, active state, site_id)
 router.put('/stripe-settings/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { account_name, publishable_key, secret_key, is_active } = req.body;
-
-    if (is_active) {
-      await supabase
-        .from('stripe_settings')
-        .update({ is_active: false })
-        .neq('id', id);
-    }
+    const { account_name, publishable_key, secret_key, is_active, site_id, site } = req.body;
 
     const updateFields = {};
     if (account_name !== undefined) updateFields.account_name = account_name;
     if (publishable_key !== undefined) updateFields.publishable_key = publishable_key;
     if (secret_key !== undefined) updateFields.secret_key = secret_key;
     if (is_active !== undefined) updateFields.is_active = is_active;
+    if (site_id !== undefined || site !== undefined) updateFields.site_id = site_id || site || 'all';
+
+    if (is_active && updateFields.site_id) {
+      await supabase
+        .from('stripe_settings')
+        .update({ is_active: false })
+        .eq('site_id', updateFields.site_id)
+        .neq('id', id);
+    }
 
     const { data, error } = await supabase
       .from('stripe_settings')
@@ -153,11 +200,12 @@ router.delete('/stripe-settings/:id', async (req, res) => {
   }
 });
 
-// 5. Create checkout session using active Stripe account
+// 5. Create checkout session using site-specific active Stripe account
 router.post('/create-checkout-session', async (req, res) => {
   try {
-    const { items } = req.body;
-    const { stripe } = await getStripeClient();
+    const { items, site_id, site } = req.body;
+    const targetSite = site_id || site;
+    const { stripe, accountName } = await getStripeClient(targetSite);
 
     const lineItems = items.map(item => {
       const rawPrice = String(item.price || '0.50').replace(/[^0-9.]/g, '');
@@ -190,7 +238,9 @@ router.post('/create-checkout-session', async (req, res) => {
       success_url: `${frontendUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${frontendUrl}/cart`,
       metadata: {
-        book_ids: bookIds
+        book_ids: bookIds,
+        site_id: targetSite || 'all',
+        account_name: accountName
       }
     };
 
@@ -218,13 +268,14 @@ router.post('/create-checkout-session', async (req, res) => {
 // 6. Retrieve session details
 router.get('/session/:id', async (req, res) => {
   try {
-    const { stripe } = await getStripeClient();
+    const { site, site_id } = req.query;
+    const { stripe } = await getStripeClient(site || site_id);
     const session = await stripe.checkout.sessions.retrieve(req.params.id);
     if (session.payment_status !== 'paid') {
       return res.status(400).json({ error: 'Payment not completed' });
     }
 
-    const bookIds = session.metadata.book_ids.split(',');
+    const bookIds = session.metadata?.book_ids ? session.metadata.book_ids.split(',') : [];
 
     const { data: books, error } = await supabase
       .from('books')
@@ -233,7 +284,7 @@ router.get('/session/:id', async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ books });
+    res.json({ books: books || [] });
   } catch (error) {
     console.error('Error retrieving session:', error);
     res.status(500).json({ error: error.message });
@@ -241,3 +292,4 @@ router.get('/session/:id', async (req, res) => {
 });
 
 module.exports = router;
+
