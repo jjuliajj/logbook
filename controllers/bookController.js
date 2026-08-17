@@ -1,11 +1,18 @@
 const supabase = require('../supabase');
 
+// Helper to resolve the site_id of a book
+const getBookSite = (b) => {
+  if (b.site_id && b.site_id !== 'all') return b.site_id;
+  if (b.details && b.details.site_id && b.details.site_id !== 'all') return b.details.site_id;
+  return 'bookpatr'; // Default existing library to bookpatr
+};
+
 exports.getAllBooks = async (req, res) => {
   try {
     const { site, site_id } = req.query;
     const targetSite = site || site_id;
 
-    // Fetch all books safely without failing if site_id column is not created in DB yet
+    // Fetch all books safely
     const { data, error } = await supabase
       .from('books')
       .select('*')
@@ -15,13 +22,14 @@ exports.getAllBooks = async (req, res) => {
     let books = data || [];
 
     if (targetSite && targetSite !== 'all') {
-      // Filter books by site_id if present; books with no site_id (legacy) or site_id 'all' are included for all storefronts
-      books = books.filter(b => {
-        const bookSite = b.site_id || (b.details && b.details.site_id);
-        if (!bookSite || bookSite === 'all') return true;
-        return bookSite === targetSite;
-      });
+      books = books.filter(b => getBookSite(b) === targetSite);
     }
+
+    // Attach computed site_id to each book response for frontend consistency
+    books = books.map(b => ({
+      ...b,
+      site_id: getBookSite(b)
+    }));
 
     res.json(books);
   } catch (error) {
@@ -29,7 +37,6 @@ exports.getAllBooks = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
-
 
 exports.getBookById = async (req, res) => {
   try {
@@ -41,7 +48,11 @@ exports.getBookById = async (req, res) => {
     
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'Book not found' });
-    res.json(data);
+
+    res.json({
+      ...data,
+      site_id: getBookSite(data)
+    });
   } catch (error) {
     console.error('Error in getBookById:', error);
     res.status(500).json({ error: error.message });
@@ -51,7 +62,7 @@ exports.getBookById = async (req, res) => {
 exports.createBook = async (req, res) => {
   try {
     const { title, author, description, category, price, details, site_id, site } = req.body;
-    const targetSite = site_id || site || 'all';
+    const targetSite = site_id || site || 'bookpatr';
     const files = req.files;
 
     let fileUrl = '';
@@ -61,7 +72,7 @@ exports.createBook = async (req, res) => {
     if (files && files.file) {
       const file = files.file[0];
       const fileName = `${Date.now()}_${file.originalname.replace(/\s+/g, '_')}`;
-      const { data: uploadData, error: uploadError } = await supabase.storage
+      const { error: uploadError } = await supabase.storage
         .from('books')
         .upload(fileName, file.buffer, {
           contentType: file.mimetype,
@@ -76,7 +87,7 @@ exports.createBook = async (req, res) => {
     if (files && files.cover) {
       const cover = files.cover[0];
       const coverName = `${Date.now()}_${cover.originalname.replace(/\s+/g, '_')}`;
-      const { data: uploadData, error: uploadError } = await supabase.storage
+      const { error: uploadError } = await supabase.storage
         .from('covers')
         .upload(coverName, cover.buffer, {
           contentType: cover.mimetype,
@@ -121,7 +132,11 @@ exports.createBook = async (req, res) => {
       insertedData = data;
     }
     
-    res.status(201).json(insertedData[0]);
+    const result = insertedData[0];
+    res.status(201).json({
+      ...result,
+      site_id: targetSite
+    });
   } catch (error) {
     console.error('Error in createBook:', error);
     res.status(500).json({ error: error.message });
@@ -143,8 +158,8 @@ exports.updateBook = async (req, res) => {
       details: typeof details === 'string' ? JSON.parse(details) : (details || {})
     };
 
-    if (site_id !== undefined || site !== undefined) {
-      const targetSite = site_id || site || 'all';
+    const targetSite = site_id || site;
+    if (targetSite) {
       if (!updateData.details) updateData.details = {};
       updateData.details.site_id = targetSite;
       updateData.site_id = targetSite;
@@ -200,13 +215,16 @@ exports.updateBook = async (req, res) => {
       updatedData = data;
     }
     
-    res.json(updatedData[0]);
+    const result = updatedData[0];
+    res.json({
+      ...result,
+      site_id: getBookSite(result)
+    });
   } catch (error) {
     console.error('Error in updateBook:', error);
     res.status(500).json({ error: error.message });
   }
 };
-
 
 exports.deleteBook = async (req, res) => {
   try {
@@ -249,21 +267,38 @@ exports.deleteAllBooks = async (req, res) => {
     const { site, site_id } = req.query;
     const targetSite = site || site_id || (req.body && (req.body.site || req.body.site_id));
 
-    let query = supabase.from('books').delete();
-
-    if (targetSite && targetSite !== 'all') {
-      query = query.eq('site_id', targetSite);
-    } else {
-      query = query.neq('id', '00000000-0000-0000-0000-000000000000');
+    if (!targetSite || targetSite === 'all') {
+      const { error } = await supabase
+        .from('books')
+        .delete()
+        .neq('id', '00000000-0000-0000-0000-000000000000');
+      
+      if (error) throw error;
+      return res.json({ message: 'All books deleted successfully' });
     }
-    
-    const { error } = await query;
-    if (error) throw error;
-    res.json({ message: targetSite && targetSite !== 'all' ? `All books for ${targetSite} deleted successfully` : 'All books deleted successfully' });
+
+    // Find books belonging to this specific site
+    const { data: allBooks, error: fetchErr } = await supabase.from('books').select('*');
+    if (fetchErr) throw fetchErr;
+
+    const idsToDelete = (allBooks || [])
+      .filter(b => getBookSite(b) === targetSite)
+      .map(b => b.id);
+
+    if (idsToDelete.length > 0) {
+      const { error: delErr } = await supabase
+        .from('books')
+        .delete()
+        .in('id', idsToDelete);
+      if (delErr) throw delErr;
+    }
+
+    res.json({ message: `Successfully deleted ${idsToDelete.length} books for ${targetSite}` });
   } catch (error) {
     console.error('Error in deleteAllBooks:', error);
     res.status(500).json({ error: error.message });
   }
 };
+
 
 
