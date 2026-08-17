@@ -5,22 +5,31 @@ exports.getAllBooks = async (req, res) => {
     const { site, site_id } = req.query;
     const targetSite = site || site_id;
 
-    let query = supabase.from('books').select('*');
-
-    if (targetSite && targetSite !== 'all') {
-      // Return books specifically assigned to this site, or general 'all' books
-      query = query.or(`site_id.eq.${targetSite},site_id.eq.all,site_id.is.null`);
-    }
-
-    const { data, error } = await query.order('created_at', { ascending: false });
+    // Fetch all books safely without failing if site_id column is not created in DB yet
+    const { data, error } = await supabase
+      .from('books')
+      .select('*')
+      .order('created_at', { ascending: false });
     
     if (error) throw error;
-    res.json(data || []);
+    let books = data || [];
+
+    if (targetSite && targetSite !== 'all') {
+      // Filter books by site_id if present; books with no site_id (legacy) or site_id 'all' are included for all storefronts
+      books = books.filter(b => {
+        const bookSite = b.site_id || (b.details && b.details.site_id);
+        if (!bookSite || bookSite === 'all') return true;
+        return bookSite === targetSite;
+      });
+    }
+
+    res.json(books);
   } catch (error) {
     console.error('Error in getAllBooks:', error);
     res.status(500).json({ error: error.message });
   }
 };
+
 
 exports.getBookById = async (req, res) => {
   try {
@@ -78,25 +87,41 @@ exports.createBook = async (req, res) => {
       coverUrl = supabase.storage.from('covers').getPublicUrl(coverName).data.publicUrl;
     }
 
+    const parsedDetails = typeof details === 'string' ? JSON.parse(details) : (details || {});
+    parsedDetails.site_id = targetSite;
+
     const bookData = { 
-      site_id: targetSite,
       title, 
       author, 
       description, 
       category, 
       price, 
-      details: typeof details === 'string' ? JSON.parse(details) : details,
+      details: parsedDetails,
       file_url: fileUrl,
       cover_url: coverUrl
     };
 
-    const { data, error } = await supabase
-      .from('books')
-      .insert([bookData])
-      .select();
+    let insertedData = null;
+    try {
+      // Try inserting with site_id column
+      const { data, error } = await supabase
+        .from('books')
+        .insert([{ ...bookData, site_id: targetSite }])
+        .select();
+      
+      if (error) throw error;
+      insertedData = data;
+    } catch (insertErr) {
+      // Fallback: insert without site_id column (saved in details.site_id)
+      const { data, error } = await supabase
+        .from('books')
+        .insert([bookData])
+        .select();
+      if (error) throw error;
+      insertedData = data;
+    }
     
-    if (error) throw error;
-    res.status(201).json(data[0]);
+    res.status(201).json(insertedData[0]);
   } catch (error) {
     console.error('Error in createBook:', error);
     res.status(500).json({ error: error.message });
@@ -115,11 +140,14 @@ exports.updateBook = async (req, res) => {
       description,
       category,
       price,
-      details: typeof details === 'string' ? JSON.parse(details) : details
+      details: typeof details === 'string' ? JSON.parse(details) : (details || {})
     };
 
     if (site_id !== undefined || site !== undefined) {
-      updateData.site_id = site_id || site || 'all';
+      const targetSite = site_id || site || 'all';
+      if (!updateData.details) updateData.details = {};
+      updateData.details.site_id = targetSite;
+      updateData.site_id = targetSite;
     }
 
     // Upload new book file if exists
@@ -152,19 +180,33 @@ exports.updateBook = async (req, res) => {
       updateData.cover_url = supabase.storage.from('covers').getPublicUrl(coverName).data.publicUrl;
     }
 
-    const { data, error } = await supabase
-      .from('books')
-      .update(updateData)
-      .eq('id', id)
-      .select();
+    let updatedData = null;
+    try {
+      const { data, error } = await supabase
+        .from('books')
+        .update(updateData)
+        .eq('id', id)
+        .select();
+      if (error) throw error;
+      updatedData = data;
+    } catch (updateErr) {
+      delete updateData.site_id;
+      const { data, error } = await supabase
+        .from('books')
+        .update(updateData)
+        .eq('id', id)
+        .select();
+      if (error) throw error;
+      updatedData = data;
+    }
     
-    if (error) throw error;
-    res.json(data[0]);
+    res.json(updatedData[0]);
   } catch (error) {
     console.error('Error in updateBook:', error);
     res.status(500).json({ error: error.message });
   }
 };
+
 
 exports.deleteBook = async (req, res) => {
   try {

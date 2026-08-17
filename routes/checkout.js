@@ -63,16 +63,19 @@ router.get('/stripe-settings', async (req, res) => {
     const { site, site_id } = req.query;
     const targetSite = site || site_id;
 
-    let query = supabase.from('stripe_settings').select('*');
-
-    if (targetSite && targetSite !== 'all') {
-      query = query.eq('site_id', targetSite);
-    }
-
-    const { data, error } = await query.order('created_at', { ascending: false });
+    const { data, error } = await supabase
+      .from('stripe_settings')
+      .select('*')
+      .order('created_at', { ascending: false });
 
     if (error) throw error;
-    res.json(data || []);
+    let settings = data || [];
+
+    if (targetSite && targetSite !== 'all') {
+      settings = settings.filter(s => !s.site_id || s.site_id === 'all' || s.site_id === targetSite);
+    }
+
+    res.json(settings);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -89,52 +92,80 @@ router.post('/stripe-settings', async (req, res) => {
     }
 
     if (is_active) {
-      // Deactivate only other accounts for the SAME site_id
-      await supabase
-        .from('stripe_settings')
-        .update({ is_active: false })
-        .eq('site_id', targetSite);
+      try {
+        await supabase
+          .from('stripe_settings')
+          .update({ is_active: false })
+          .eq('site_id', targetSite);
+      } catch (deactErr) {
+        await supabase
+          .from('stripe_settings')
+          .update({ is_active: false })
+          .neq('id', '00000000-0000-0000-0000-000000000000');
+      }
     }
 
-    const { data, error } = await supabase
-      .from('stripe_settings')
-      .insert([{
-        site_id: targetSite,
-        account_name,
-        publishable_key: publishable_key || '',
-        secret_key,
-        is_active: Boolean(is_active)
-      }])
-      .select();
+    let insertedSetting = null;
+    try {
+      const { data, error } = await supabase
+        .from('stripe_settings')
+        .insert([{
+          site_id: targetSite,
+          account_name,
+          publishable_key: publishable_key || '',
+          secret_key,
+          is_active: Boolean(is_active)
+        }])
+        .select();
 
-    if (error) throw error;
-    res.status(201).json(data[0]);
+      if (error) throw error;
+      insertedSetting = data;
+    } catch (insertErr) {
+      // Fallback without site_id column
+      const { data, error } = await supabase
+        .from('stripe_settings')
+        .insert([{
+          account_name,
+          publishable_key: publishable_key || '',
+          secret_key,
+          is_active: Boolean(is_active)
+        }])
+        .select();
+
+      if (error) throw error;
+      insertedSetting = data;
+    }
+
+    res.status(201).json(insertedSetting[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// 3. Activate a Stripe account (deactivates other accounts for the same site)
+// 3. Activate a Stripe account
 router.put('/stripe-settings/:id/activate', async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Get the target record first to know its site_id
-    const { data: targetRecord, error: getError } = await supabase
-      .from('stripe_settings')
-      .select('site_id')
-      .eq('id', id)
-      .single();
+    try {
+      const { data: targetRecord } = await supabase
+        .from('stripe_settings')
+        .select('*')
+        .eq('id', id)
+        .single();
 
-    if (getError || !targetRecord) throw new Error('Stripe setting not found');
+      const targetSite = (targetRecord && targetRecord.site_id) || 'all';
 
-    const targetSite = targetRecord.site_id || 'all';
-
-    // Deactivate all accounts for the SAME site_id
-    await supabase
-      .from('stripe_settings')
-      .update({ is_active: false })
-      .eq('site_id', targetSite);
+      await supabase
+        .from('stripe_settings')
+        .update({ is_active: false })
+        .eq('site_id', targetSite);
+    } catch (err) {
+      await supabase
+        .from('stripe_settings')
+        .update({ is_active: false })
+        .neq('id', '00000000-0000-0000-0000-000000000000');
+    }
 
     // Activate selected account
     const { data, error } = await supabase
@@ -149,6 +180,7 @@ router.put('/stripe-settings/:id/activate', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 // 3b. Update a Stripe account configuration (name, keys, active state, site_id)
 router.put('/stripe-settings/:id', async (req, res) => {
