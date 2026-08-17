@@ -1,9 +1,11 @@
--- Run this in your Supabase SQL Editor
+-- =========================================================================
+-- RUN THIS IN YOUR SUPABASE SQL EDITOR TO FIX STORAGE UPLOAD & MULTI-SITE
+-- =========================================================================
 
--- 1. Enable UUID extension if not enabled
+-- 1. Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- 2. Create books table with site_id for multi-store isolation
+-- 2. Create or Update Books Table with site_id
 CREATE TABLE IF NOT EXISTS books (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   site_id TEXT DEFAULT 'all',
@@ -18,7 +20,7 @@ CREATE TABLE IF NOT EXISTS books (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 3. Create stripe_settings table for multi-store Stripe account management
+-- 3. Create or Update Stripe Settings Table
 CREATE TABLE IF NOT EXISTS stripe_settings (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   site_id TEXT DEFAULT 'all',
@@ -29,15 +31,38 @@ CREATE TABLE IF NOT EXISTS stripe_settings (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 4. Fast indexes for multi-store filtering
-CREATE INDEX IF NOT EXISTS idx_books_site_id ON books(site_id);
-CREATE INDEX IF NOT EXISTS idx_stripe_settings_site_id ON stripe_settings(site_id);
+-- 4. Disable RLS or grant full access on tables
+ALTER TABLE books DISABLE ROW LEVEL SECURITY;
+ALTER TABLE stripe_settings DISABLE ROW LEVEL SECURITY;
 
--- 5. MIGRATION FOR EXISTING SUPABASE TABLES (Run if tables already exist):
--- ALTER TABLE books ADD COLUMN IF NOT EXISTS site_id TEXT DEFAULT 'all';
--- ALTER TABLE stripe_settings ADD COLUMN IF NOT EXISTS site_id TEXT DEFAULT 'all';
--- CREATE INDEX IF NOT EXISTS idx_books_site_id ON books(site_id);
--- CREATE INDEX IF NOT EXISTS idx_stripe_settings_site_id ON stripe_settings(site_id);
--- UPDATE books SET site_id = 'all' WHERE site_id IS NULL;
--- UPDATE stripe_settings SET site_id = 'all' WHERE site_id IS NULL;
+-- 5. Fix Supabase Storage Buckets & Policies (Fixes "new row violates row-level security policy" on file/cover upload)
+INSERT INTO storage.buckets (id, name, public) 
+VALUES ('books', 'books', true) 
+ON CONFLICT (id) DO UPDATE SET public = true;
+
+INSERT INTO storage.buckets (id, name, public) 
+VALUES ('covers', 'covers', true) 
+ON CONFLICT (id) DO UPDATE SET public = true;
+
+-- Drop old conflicting policies if exist
+DROP POLICY IF EXISTS "Public Upload Books" ON storage.objects;
+DROP POLICY IF EXISTS "Public Read Books" ON storage.objects;
+DROP POLICY IF EXISTS "Public Update Books" ON storage.objects;
+DROP POLICY IF EXISTS "Public Delete Books" ON storage.objects;
+DROP POLICY IF EXISTS "Public Upload Covers" ON storage.objects;
+DROP POLICY IF EXISTS "Public Read Covers" ON storage.objects;
+DROP POLICY IF EXISTS "Public Update Covers" ON storage.objects;
+DROP POLICY IF EXISTS "Public Delete Covers" ON storage.objects;
+
+-- Create full read/write storage policies for books and covers buckets
+CREATE POLICY "Public Upload Books" ON storage.objects FOR INSERT WITH CHECK (bucket_id = 'books');
+CREATE POLICY "Public Read Books" ON storage.objects FOR SELECT USING (bucket_id = 'books');
+CREATE POLICY "Public Update Books" ON storage.objects FOR UPDATE USING (bucket_id = 'books');
+CREATE POLICY "Public Delete Books" ON storage.objects FOR DELETE USING (bucket_id = 'books');
+
+CREATE POLICY "Public Upload Covers" ON storage.objects FOR INSERT WITH CHECK (bucket_id = 'covers');
+CREATE POLICY "Public Read Covers" ON storage.objects FOR SELECT USING (bucket_id = 'covers');
+CREATE POLICY "Public Update Covers" ON storage.objects FOR UPDATE USING (bucket_id = 'covers');
+CREATE POLICY "Public Delete Covers" ON storage.objects FOR DELETE USING (bucket_id = 'covers');
+
 
