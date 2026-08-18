@@ -12,12 +12,36 @@ exports.getAllBooks = async (req, res) => {
     const { site, site_id } = req.query;
     const targetSite = site || site_id;
 
+    // Edge cache header: Caches API responses at Vercel Edge CDN to minimize Fast Origin Transfer (FOT)
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+
     // Fetch all books safely
-    const { data, error } = await supabase
+    let query = supabase
       .from('books')
       .select('*')
       .order('created_at', { ascending: false });
-    
+
+    if (targetSite && targetSite !== 'all') {
+      try {
+        const { data: siteData, error: siteError } = await supabase
+          .from('books')
+          .select('*')
+          .eq('site_id', targetSite)
+          .order('created_at', { ascending: false });
+
+        if (!siteError && siteData) {
+          const formatted = siteData.map(b => ({
+            ...b,
+            site_id: getBookSite(b)
+          }));
+          return res.json(formatted);
+        }
+      } catch {
+        // Fallback to fetch all and filter
+      }
+    }
+
+    const { data, error } = await query;
     if (error) throw error;
     let books = data || [];
 
@@ -61,14 +85,14 @@ exports.getBookById = async (req, res) => {
 
 exports.createBook = async (req, res) => {
   try {
-    const { title, author, description, category, price, details, site_id, site } = req.body;
+    const { title, author, description, category, price, details, site_id, site, file_url, cover_url } = req.body;
     const targetSite = site_id || site || 'bookpatr';
     const files = req.files;
 
-    let fileUrl = '';
-    let coverUrl = '';
+    let fileUrl = file_url || '';
+    let coverUrl = cover_url || '';
 
-    // Upload book file if exists
+    // Upload book file if exists in multipart form
     if (files && files.file) {
       const file = files.file[0];
       const fileName = `${Date.now()}_${file.originalname.replace(/\s+/g, '_')}`;
@@ -83,7 +107,7 @@ exports.createBook = async (req, res) => {
       fileUrl = supabase.storage.from('books').getPublicUrl(fileName).data.publicUrl;
     }
 
-    // Upload cover image if exists
+    // Upload cover image if exists in multipart form
     if (files && files.cover) {
       const cover = files.cover[0];
       const coverName = `${Date.now()}_${cover.originalname.replace(/\s+/g, '_')}`;
@@ -146,7 +170,7 @@ exports.createBook = async (req, res) => {
 exports.updateBook = async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, author, description, category, price, details, site_id, site } = req.body;
+    const { title, author, description, category, price, details, site_id, site, file_url, cover_url } = req.body;
     const files = req.files;
 
     let updateData = {
@@ -157,6 +181,9 @@ exports.updateBook = async (req, res) => {
       price,
       details: typeof details === 'string' ? JSON.parse(details) : (details || {})
     };
+
+    if (file_url) updateData.file_url = file_url;
+    if (cover_url) updateData.cover_url = cover_url;
 
     const targetSite = site_id || site;
     if (targetSite) {
@@ -299,6 +326,3 @@ exports.deleteAllBooks = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
-
-
-
