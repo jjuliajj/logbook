@@ -3,46 +3,66 @@ const router = express.Router();
 const Stripe = require('stripe');
 const supabase = require('../supabase');
 
+// Helper to parse and extract site_id and clean display name from a stripe setting
+function parseStripeSetting(r) {
+  if (!r) return null;
+  let site_id = r.site_id;
+  let cleanName = r.account_name || '';
+
+  // Extract [site_id] prefix from account_name if present
+  const match = r.account_name && r.account_name.match(/^\[([a-zA-Z0-9_\-]+)\]\s*(.*)$/);
+  if (match) {
+    site_id = match[1];
+    cleanName = match[2] || r.account_name;
+  } else if (!site_id) {
+    site_id = 'bookpatr'; // default legacy records to bookpatr
+  }
+
+  return {
+    ...r,
+    site_id: (site_id || 'bookpatr').toLowerCase().trim(),
+    account_name: cleanName,
+    raw_account_name: r.account_name,
+  };
+}
+
 // Helper to get active Stripe client dynamically from DB per site or fallback to global / .env
 async function getStripeClient(siteId) {
   const targetSite = siteId && siteId !== 'all' ? siteId.toLowerCase().trim() : null;
 
   try {
-    // 1. Try to find active Stripe account configured specifically for this site
-    if (targetSite) {
-      const { data: siteData, error: siteError } = await supabase
-        .from('stripe_settings')
-        .select('*')
-        .eq('site_id', targetSite)
-        .eq('is_active', true)
-        .limit(1)
-        .maybeSingle();
-
-      if (!siteError && siteData && siteData.secret_key) {
-        return {
-          stripe: new Stripe(siteData.secret_key),
-          accountName: siteData.account_name,
-          secretKey: siteData.secret_key,
-          siteId: targetSite
-        };
-      }
-    }
-
-    // 2. Fallback to active global Stripe account (site_id = 'all' or any active)
-    const { data: globalData, error: globalError } = await supabase
+    const { data: allSettings, error } = await supabase
       .from('stripe_settings')
       .select('*')
-      .eq('is_active', true)
-      .limit(1)
-      .maybeSingle();
+      .order('created_at', { ascending: false });
 
-    if (!globalError && globalData && globalData.secret_key) {
-      return {
-        stripe: new Stripe(globalData.secret_key),
-        accountName: globalData.account_name,
-        secretKey: globalData.secret_key,
-        siteId: globalData.site_id || 'all'
-      };
+    if (!error && allSettings && allSettings.length > 0) {
+      const parsedSettings = allSettings.map(parseStripeSetting);
+      const activeSettings = parsedSettings.filter(s => s.is_active && s.secret_key);
+
+      // 1. Try to find active Stripe account configured specifically for this site
+      if (targetSite) {
+        const siteSetting = activeSettings.find(s => s.site_id === targetSite);
+        if (siteSetting && siteSetting.secret_key) {
+          return {
+            stripe: new Stripe(siteSetting.secret_key),
+            accountName: siteSetting.account_name,
+            secretKey: siteSetting.secret_key,
+            siteId: targetSite
+          };
+        }
+      }
+
+      // 2. Fallback to active global Stripe account (site_id = 'all')
+      const globalSetting = activeSettings.find(s => s.site_id === 'all');
+      if (globalSetting && globalSetting.secret_key) {
+        return {
+          stripe: new Stripe(globalSetting.secret_key),
+          accountName: globalSetting.account_name,
+          secretKey: globalSetting.secret_key,
+          siteId: 'all'
+        };
+      }
     }
   } catch (err) {
     console.log('Stripe DB query fallback to env:', err.message);
@@ -61,7 +81,7 @@ async function getStripeClient(siteId) {
 router.get('/stripe-settings', async (req, res) => {
   try {
     const { site, site_id } = req.query;
-    const targetSite = site || site_id;
+    const targetSite = (site || site_id)?.toLowerCase().trim();
 
     const { data, error } = await supabase
       .from('stripe_settings')
@@ -69,10 +89,10 @@ router.get('/stripe-settings', async (req, res) => {
       .order('created_at', { ascending: false });
 
     if (error) throw error;
-    let settings = data || [];
+    let settings = (data || []).map(parseStripeSetting);
 
     if (targetSite && targetSite !== 'all') {
-      settings = settings.filter(s => !s.site_id || s.site_id === 'all' || s.site_id === targetSite);
+      settings = settings.filter(s => s.site_id === 'all' || s.site_id === targetSite);
     }
 
     res.json(settings);
@@ -85,86 +105,88 @@ router.get('/stripe-settings', async (req, res) => {
 router.post('/stripe-settings', async (req, res) => {
   try {
     const { account_name, publishable_key, secret_key, is_active, site_id, site } = req.body;
-    const targetSite = site_id || site || 'all';
+    const targetSite = (site_id || site || 'all').toLowerCase().trim();
 
     if (!account_name || !secret_key) {
       return res.status(400).json({ error: 'Account Name and Secret Key are required.' });
     }
 
+    const cleanName = account_name.replace(/^\[[a-zA-Z0-9_\-]+\]\s*/, '').trim();
+    const formattedAccountName = `[${targetSite}] ${cleanName}`;
+
+    // If activating this account, deactivate OTHER accounts belonging to this specific site only!
     if (is_active) {
-      try {
-        await supabase
-          .from('stripe_settings')
-          .update({ is_active: false })
-          .eq('site_id', targetSite);
-      } catch (deactErr) {
-        await supabase
-          .from('stripe_settings')
-          .update({ is_active: false })
-          .neq('id', '00000000-0000-0000-0000-000000000000');
+      const { data: allData } = await supabase.from('stripe_settings').select('*');
+      if (allData) {
+        const toDeactivate = allData
+          .map(parseStripeSetting)
+          .filter(s => s.site_id === targetSite && s.is_active)
+          .map(s => s.id);
+        if (toDeactivate.length > 0) {
+          await supabase.from('stripe_settings').update({ is_active: false }).in('id', toDeactivate);
+        }
       }
     }
+
+    const insertPayload = {
+      account_name: formattedAccountName,
+      publishable_key: publishable_key || '',
+      secret_key,
+      is_active: Boolean(is_active)
+    };
 
     let insertedSetting = null;
     try {
       const { data, error } = await supabase
         .from('stripe_settings')
-        .insert([{
-          site_id: targetSite,
-          account_name,
-          publishable_key: publishable_key || '',
-          secret_key,
-          is_active: Boolean(is_active)
-        }])
+        .insert([{ ...insertPayload, site_id: targetSite }])
         .select();
-
       if (error) throw error;
       insertedSetting = data;
-    } catch (insertErr) {
-      // Fallback without site_id column
+    } catch {
       const { data, error } = await supabase
         .from('stripe_settings')
-        .insert([{
-          account_name,
-          publishable_key: publishable_key || '',
-          secret_key,
-          is_active: Boolean(is_active)
-        }])
+        .insert([insertPayload])
         .select();
-
       if (error) throw error;
       insertedSetting = data;
     }
 
-    res.status(201).json(insertedSetting[0]);
+    res.status(201).json(parseStripeSetting(insertedSetting[0]));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// 3. Activate a Stripe account
+// 3. Activate a Stripe account for its specific site
 router.put('/stripe-settings/:id/activate', async (req, res) => {
   try {
     const { id } = req.params;
+    const { site_id, site } = req.body || {};
 
-    try {
-      const { data: targetRecord } = await supabase
-        .from('stripe_settings')
-        .select('*')
-        .eq('id', id)
-        .single();
+    const { data: targetRecord, error: findErr } = await supabase
+      .from('stripe_settings')
+      .select('*')
+      .eq('id', id)
+      .single();
 
-      const targetSite = (targetRecord && targetRecord.site_id) || 'all';
+    if (findErr || !targetRecord) {
+      return res.status(404).json({ error: 'Stripe configuration not found' });
+    }
 
-      await supabase
-        .from('stripe_settings')
-        .update({ is_active: false })
-        .eq('site_id', targetSite);
-    } catch (err) {
-      await supabase
-        .from('stripe_settings')
-        .update({ is_active: false })
-        .neq('id', '00000000-0000-0000-0000-000000000000');
+    const parsed = parseStripeSetting(targetRecord);
+    const targetSite = (site_id || site || parsed.site_id || 'all').toLowerCase().trim();
+
+    // Deactivate other accounts belonging to this site only
+    const { data: allData } = await supabase.from('stripe_settings').select('*');
+    if (allData) {
+      const toDeactivate = allData
+        .map(parseStripeSetting)
+        .filter(s => s.id !== id && s.site_id === targetSite && s.is_active)
+        .map(s => s.id);
+      if (toDeactivate.length > 0) {
+        await supabase.from('stripe_settings').update({ is_active: false }).in('id', toDeactivate);
+      }
     }
 
     // Activate selected account
@@ -175,42 +197,66 @@ router.put('/stripe-settings/:id/activate', async (req, res) => {
       .select();
 
     if (error) throw error;
-    res.json(data[0]);
+    res.json(parseStripeSetting(data[0]));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-
-// 3b. Update a Stripe account configuration (name, keys, active state, site_id)
+// 3b. Update a Stripe account configuration
 router.put('/stripe-settings/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { account_name, publishable_key, secret_key, is_active, site_id, site } = req.body;
 
-    const updateFields = {};
-    if (account_name !== undefined) updateFields.account_name = account_name;
+    const { data: currentRecord } = await supabase.from('stripe_settings').select('*').eq('id', id).single();
+    const currentParsed = parseStripeSetting(currentRecord);
+
+    const targetSite = (site_id || site || currentParsed?.site_id || 'all').toLowerCase().trim();
+    const cleanName = (account_name !== undefined ? account_name : currentParsed?.account_name || '')
+      .replace(/^\[[a-zA-Z0-9_\-]+\]\s*/, '').trim();
+    const formattedAccountName = `[${targetSite}] ${cleanName}`;
+
+    const updateFields = {
+      account_name: formattedAccountName
+    };
     if (publishable_key !== undefined) updateFields.publishable_key = publishable_key;
     if (secret_key !== undefined) updateFields.secret_key = secret_key;
     if (is_active !== undefined) updateFields.is_active = is_active;
-    if (site_id !== undefined || site !== undefined) updateFields.site_id = site_id || site || 'all';
 
-    if (is_active && updateFields.site_id) {
-      await supabase
-        .from('stripe_settings')
-        .update({ is_active: false })
-        .eq('site_id', updateFields.site_id)
-        .neq('id', id);
+    if (is_active) {
+      const { data: allData } = await supabase.from('stripe_settings').select('*');
+      if (allData) {
+        const toDeactivate = allData
+          .map(parseStripeSetting)
+          .filter(s => s.id !== id && s.site_id === targetSite && s.is_active)
+          .map(s => s.id);
+        if (toDeactivate.length > 0) {
+          await supabase.from('stripe_settings').update({ is_active: false }).in('id', toDeactivate);
+        }
+      }
     }
 
-    const { data, error } = await supabase
-      .from('stripe_settings')
-      .update(updateFields)
-      .eq('id', id)
-      .select();
+    let updatedData = null;
+    try {
+      const { data, error } = await supabase
+        .from('stripe_settings')
+        .update({ ...updateFields, site_id: targetSite })
+        .eq('id', id)
+        .select();
+      if (error) throw error;
+      updatedData = data;
+    } catch {
+      const { data, error } = await supabase
+        .from('stripe_settings')
+        .update(updateFields)
+        .eq('id', id)
+        .select();
+      if (error) throw error;
+      updatedData = data;
+    }
 
-    if (error) throw error;
-    res.json(data[0]);
+    res.json(parseStripeSetting(updatedData[0]));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -237,7 +283,9 @@ router.post('/create-checkout-session', async (req, res) => {
   try {
     const { items, site_id, site } = req.body;
     const targetSite = site_id || site;
-    const { stripe, accountName } = await getStripeClient(targetSite);
+    const { stripe, accountName, siteId: resolvedSiteId } = await getStripeClient(targetSite);
+
+    console.log(`[Stripe Checkout] Creating session for site: "${targetSite}" -> Using Stripe Gateway: "${accountName}" (Site ID: "${resolvedSiteId}")`);
 
     const lineItems = items.map(item => {
       const rawPrice = String(item.price || '0.50').replace(/[^0-9.]/g, '');
@@ -324,4 +372,3 @@ router.get('/session/:id', async (req, res) => {
 });
 
 module.exports = router;
-
