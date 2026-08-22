@@ -316,16 +316,31 @@ router.post('/create-checkout-session', async (req, res) => {
 
         const productData = {
           name: item.title || 'Digital E-Book',
+          tax_code: 'txcd_10202000', // Digital Books / E-books tax code for Stripe Managed Payments
         };
         if (isValidUrl(item.cover_url)) {
           productData.images = [item.cover_url];
         }
 
-        const priceObj = await stripe.prices.create({
-          currency: 'usd',
-          unit_amount: unitAmount,
-          product_data: productData,
-        });
+        let priceObj;
+        try {
+          priceObj = await stripe.prices.create({
+            currency: 'usd',
+            unit_amount: unitAmount,
+            product_data: productData,
+          });
+        } catch (priceErr) {
+          // If tax_code is not supported on some account types, retry without it
+          console.warn('Price create with tax_code failed, retrying without tax_code:', priceErr.message);
+          priceObj = await stripe.prices.create({
+            currency: 'usd',
+            unit_amount: unitAmount,
+            product_data: {
+              name: item.title || 'Digital E-Book',
+              ...(isValidUrl(item.cover_url) ? { images: [item.cover_url] } : {})
+            },
+          });
+        }
 
         paymentLinkLineItems.push({
           price: priceObj.id,
@@ -359,7 +374,7 @@ router.post('/create-checkout-session', async (req, res) => {
     } catch (plinkErr) {
       console.warn('[Stripe Payment Link] Creation failed, falling back to Checkout Session:', plinkErr.message);
 
-      // --- STRATEGY 2: Fallback to Checkout Sessions API (Enhanced with anti-fraud params) ---
+      // --- STRATEGY 2: Fallback to Checkout Sessions API (Enhanced with anti-fraud & managed payments) ---
       const sessionLineItems = items.map(item => {
         const rawPrice = String(item.price || '0.50').replace(/[^0-9.]/g, '');
         let numericPrice = parseFloat(rawPrice) || 0.50;
@@ -368,6 +383,7 @@ router.post('/create-checkout-session', async (req, res) => {
 
         const productData = {
           name: item.title || 'Digital E-Book',
+          tax_code: 'txcd_10202000',
         };
         if (isValidUrl(item.cover_url)) {
           productData.images = [item.cover_url];
@@ -403,7 +419,21 @@ router.post('/create-checkout-session', async (req, res) => {
         sessionParams.customer_email = customer_email;
       }
 
-      const session = await stripe.checkout.sessions.create(sessionParams);
+      let session;
+      try {
+        session = await stripe.checkout.sessions.create(sessionParams);
+      } catch (sessErr) {
+        console.warn('Standard session creation failed, retrying with managed_payments disabled:', sessErr.message);
+        if (sessErr.message && (sessErr.message.includes('managed_payments') || sessErr.message.includes('tax'))) {
+          session = await stripe.checkout.sessions.create({
+            ...sessionParams,
+            managed_payments: { enabled: false }
+          });
+        } else {
+          throw sessErr;
+        }
+      }
+
       returnId = session.id;
       returnUrl = session.url;
     }
@@ -411,7 +441,10 @@ router.post('/create-checkout-session', async (req, res) => {
     res.json({ id: returnId, url: returnUrl });
   } catch (error) {
     console.error('Stripe checkout error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ 
+      error: 'The payment gateway is temporarily initializing. Please try again in a few moments.',
+      details: error.message 
+    });
   }
 });
 
