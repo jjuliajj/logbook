@@ -278,67 +278,137 @@ router.delete('/stripe-settings/:id', async (req, res) => {
   }
 });
 
-// 5. Create checkout session using site-specific active Stripe account
+// 5. Create checkout session / payment link using site-specific active Stripe account
 router.post('/create-checkout-session', async (req, res) => {
   try {
-    const { items, site_id, site } = req.body;
+    const { items, site_id, site, customer_email } = req.body;
     const targetSite = site_id || site;
     const { stripe, accountName, siteId: resolvedSiteId } = await getStripeClient(targetSite);
 
-    console.log(`[Stripe Checkout] Creating session for site: "${targetSite}" -> Using Stripe Gateway: "${accountName}" (Site ID: "${resolvedSiteId}")`);
+    console.log(`[Stripe Checkout] Creating payment link for site: "${targetSite}" -> Using Stripe Gateway: "${accountName}" (Site ID: "${resolvedSiteId}")`);
 
-    const lineItems = items.map(item => {
-      const rawPrice = String(item.price || '0.50').replace(/[^0-9.]/g, '');
-      let numericPrice = parseFloat(rawPrice) || 0.50;
-      let unitAmount = Math.round(numericPrice * 100);
-      if (unitAmount < 50) unitAmount = 50; // Stripe minimum amount is 50 cents ($0.50 USD)
+    if (!items || !items.length) {
+      return res.status(400).json({ error: 'No items provided' });
+    }
 
-      return {
-        price_data: {
-          currency: 'usd',
-          product_data: {
-            name: item.title,
-            images: item.cover_url ? [item.cover_url] : [],
-            tax_code: 'txcd_10202000', // Digital Books / E-books product tax code
-          },
-          unit_amount: unitAmount,
-        },
-        quantity: item.quantity,
-      };
-    });
+    const isValidUrl = (url) => {
+      if (!url || typeof url !== 'string') return false;
+      return url.startsWith('http://') || url.startsWith('https://');
+    };
 
     const bookIds = items.map(item => item.id).join(',');
     let origin = req.headers.origin || (req.headers.referer ? new URL(req.headers.referer).origin : null);
     const rawFrontendUrl = process.env.FRONTEND_URL || origin || 'https://bookpatr.vercel.app';
     const frontendUrl = rawFrontendUrl.replace(/\/$/, '');
 
-    const sessionParams = {
-      line_items: lineItems,
-      mode: 'payment',
-      success_url: `${frontendUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${frontendUrl}/cart`,
-      metadata: {
-        book_ids: bookIds,
-        site_id: targetSite || 'all',
-        account_name: accountName
-      }
-    };
+    let returnUrl = null;
+    let returnId = null;
 
-    let session;
+    // --- STRATEGY 1: Create Stripe Payment Link (Produces buy.stripe.com) ---
     try {
-      session = await stripe.checkout.sessions.create(sessionParams);
-    } catch (err) {
-      if (err.message && (err.message.includes('managed_payments') || err.message.includes('tax code'))) {
-        session = await stripe.checkout.sessions.create({
-          ...sessionParams,
-          managed_payments: { enabled: false }
+      const paymentLinkLineItems = [];
+
+      for (const item of items) {
+        const rawPrice = String(item.price || '0.50').replace(/[^0-9.]/g, '');
+        let numericPrice = parseFloat(rawPrice) || 0.50;
+        let unitAmount = Math.round(numericPrice * 100);
+        if (unitAmount < 50) unitAmount = 50; // Stripe minimum amount is 50 cents ($0.50 USD)
+
+        const productData = {
+          name: item.title || 'Digital E-Book',
+        };
+        if (isValidUrl(item.cover_url)) {
+          productData.images = [item.cover_url];
+        }
+
+        const priceObj = await stripe.prices.create({
+          currency: 'usd',
+          unit_amount: unitAmount,
+          product_data: productData,
         });
-      } else {
-        throw err;
+
+        paymentLinkLineItems.push({
+          price: priceObj.id,
+          quantity: item.quantity || 1,
+        });
       }
+
+      const paymentLinkParams = {
+        line_items: paymentLinkLineItems,
+        after_completion: {
+          type: 'redirect',
+          redirect: {
+            url: `${frontendUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
+          },
+        },
+        billing_address_collection: 'required', // Bắt buộc nhập địa chỉ & ZIP để qua AVS của ngân hàng
+        phone_number_collection: {
+          enabled: true, // Thu thập SĐT giúp Stripe Radar xác thực danh tính
+        },
+        metadata: {
+          book_ids: bookIds,
+          site_id: targetSite || 'all',
+          account_name: accountName,
+        },
+      };
+
+      const paymentLink = await stripe.paymentLinks.create(paymentLinkParams);
+      returnId = paymentLink.id;
+      returnUrl = paymentLink.url; // URL dạng https://buy.stripe.com/...
+      console.log(`[Stripe Payment Link] Created successfully: ${paymentLink.url}`);
+    } catch (plinkErr) {
+      console.warn('[Stripe Payment Link] Creation failed, falling back to Checkout Session:', plinkErr.message);
+
+      // --- STRATEGY 2: Fallback to Checkout Sessions API (Enhanced with anti-fraud params) ---
+      const sessionLineItems = items.map(item => {
+        const rawPrice = String(item.price || '0.50').replace(/[^0-9.]/g, '');
+        let numericPrice = parseFloat(rawPrice) || 0.50;
+        let unitAmount = Math.round(numericPrice * 100);
+        if (unitAmount < 50) unitAmount = 50;
+
+        const productData = {
+          name: item.title || 'Digital E-Book',
+        };
+        if (isValidUrl(item.cover_url)) {
+          productData.images = [item.cover_url];
+        }
+
+        return {
+          price_data: {
+            currency: 'usd',
+            product_data: productData,
+            unit_amount: unitAmount,
+          },
+          quantity: item.quantity || 1,
+        };
+      });
+
+      const sessionParams = {
+        line_items: sessionLineItems,
+        mode: 'payment',
+        billing_address_collection: 'required',
+        phone_number_collection: {
+          enabled: true,
+        },
+        success_url: `${frontendUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${frontendUrl}/cart`,
+        metadata: {
+          book_ids: bookIds,
+          site_id: targetSite || 'all',
+          account_name: accountName,
+        },
+      };
+
+      if (customer_email) {
+        sessionParams.customer_email = customer_email;
+      }
+
+      const session = await stripe.checkout.sessions.create(sessionParams);
+      returnId = session.id;
+      returnUrl = session.url;
     }
 
-    res.json({ id: session.id, url: session.url });
+    res.json({ id: returnId, url: returnUrl });
   } catch (error) {
     console.error('Stripe checkout error:', error);
     res.status(500).json({ error: error.message });
@@ -349,8 +419,39 @@ router.post('/create-checkout-session', async (req, res) => {
 router.get('/session/:id', async (req, res) => {
   try {
     const { site, site_id } = req.query;
-    const { stripe } = await getStripeClient(site || site_id);
-    const session = await stripe.checkout.sessions.retrieve(req.params.id);
+    const targetSite = site || site_id;
+    const { stripe } = await getStripeClient(targetSite);
+
+    let session = null;
+
+    // 1. Try retrieving with targeted Stripe client
+    try {
+      session = await stripe.checkout.sessions.retrieve(req.params.id);
+    } catch (sessionErr) {
+      console.warn(`Could not retrieve session with primary client (${sessionErr.message}), searching other active Stripe accounts...`);
+      
+      // 2. Fallback: Search all active Stripe accounts in database
+      const { data: allSettings } = await supabase.from('stripe_settings').select('*');
+      if (allSettings && allSettings.length > 0) {
+        for (const setting of allSettings) {
+          if (setting.secret_key && setting.is_active) {
+            try {
+              const tempStripe = new Stripe(setting.secret_key);
+              const foundSession = await tempStripe.checkout.sessions.retrieve(req.params.id);
+              if (foundSession) {
+                session = foundSession;
+                break;
+              }
+            } catch (_) {}
+          }
+        }
+      }
+    }
+
+    if (!session) {
+      return res.status(404).json({ error: 'Checkout session not found' });
+    }
+
     if (session.payment_status !== 'paid') {
       return res.status(400).json({ error: 'Payment not completed' });
     }
