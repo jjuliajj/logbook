@@ -953,13 +953,17 @@ router.post('/paypal/create-order', async (req, res) => {
           items: lineItems
         }
       ],
-      application_context: {
-        brand_name: targetSite ? targetSite.toUpperCase() : 'E-Book Store',
-        landing_page: 'BILLING',
-        shipping_preference: 'NO_SHIPPING',
-        user_action: 'PAY_NOW',
-        return_url: `${frontendUrl}/success?provider=paypal&site_id=${targetSite || 'all'}&order_code=${orderCode}`,
-        cancel_url: `${frontendUrl}/cart`
+      payment_source: {
+        paypal: {
+          experience_context: {
+            brand_name: targetSite ? targetSite.toUpperCase() : 'E-Book Store',
+            landing_page: 'GUEST_CHECKOUT',
+            shipping_preference: 'NO_SHIPPING',
+            user_action: 'PAY_NOW',
+            return_url: `${frontendUrl}/success?provider=paypal&site_id=${targetSite || 'all'}&order_code=${orderCode}`,
+            cancel_url: `${frontendUrl}/cart`
+          }
+        }
       }
     };
 
