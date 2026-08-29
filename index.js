@@ -19,12 +19,14 @@ app.use(express.json());
 const bookRoutes = require('./routes/books');
 const checkoutRoutes = require('./routes/checkout');
 const contactRoutes = require('./routes/contact');
+const { router: ordersRoutes } = require('./routes/orders');
 
 // Use routes
 app.use('/api/books', bookRoutes);
 app.use('/api/checkout', checkoutRoutes);
 app.use('/api/contact', contactRoutes);
 app.use('/api/support', contactRoutes);
+app.use('/api/orders', ordersRoutes);
 
 app.get('/', (req, res) => {
   res.send('Bookpatr Backend API is running.....');

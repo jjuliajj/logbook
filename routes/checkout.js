@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const Stripe = require('stripe');
 const supabase = require('../supabase');
+const { purgeExpiredPendingOrders, generateOrderCode } = require('./orders');
 
 // Helper to parse and extract site_id and clean display name from a stripe setting
 function parseStripeSetting(r) {
@@ -281,7 +282,7 @@ router.delete('/stripe-settings/:id', async (req, res) => {
 // 5. Create checkout session / payment link using site-specific active Stripe account
 router.post('/create-checkout-session', async (req, res) => {
   try {
-    const { items, site_id, site, customer_email } = req.body;
+    const { items, site_id, site, customer_email, email, customer_name, first_name, last_name } = req.body;
     const targetSite = site_id || site;
     const { stripe, accountName, siteId: resolvedSiteId } = await getStripeClient(targetSite);
 
@@ -289,6 +290,50 @@ router.post('/create-checkout-session', async (req, res) => {
 
     if (!items || !items.length) {
       return res.status(400).json({ error: 'No items provided' });
+    }
+
+    // Auto-run background purge for expired pending orders older than 2 days
+    purgeExpiredPendingOrders().catch(() => {});
+
+    // Prepare Customer Info & Pending Order
+    const targetEmail = (customer_email || email || '').trim();
+    let fullName = customer_name ? customer_name.trim() : '';
+    if (!fullName && (first_name || last_name)) {
+      fullName = `${first_name || ''} ${last_name || ''}`.trim();
+    }
+    if (!fullName && targetEmail) fullName = targetEmail.split('@')[0];
+
+    const orderCode = generateOrderCode();
+    let totalOrderAmount = 0;
+    items.forEach(item => {
+      const rawPrice = String(item.price || '0.50').replace(/[^0-9.]/g, '');
+      const p = parseFloat(rawPrice) || 0.50;
+      const q = parseInt(item.quantity, 10) || 1;
+      totalOrderAmount += p * q;
+    });
+
+    let createdOrder = null;
+    try {
+      if (targetEmail) {
+        const { data: ordData } = await supabase
+          .from('orders')
+          .insert([{
+            order_code: orderCode,
+            site_id: (targetSite || 'bookpatr').toLowerCase().trim(),
+            customer_name: fullName || 'Valued Customer',
+            customer_email: targetEmail,
+            items: items,
+            total_amount: parseFloat(totalOrderAmount.toFixed(2)),
+            currency: 'USD',
+            payment_method: 'stripe',
+            status: 'pending',
+            expires_at: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
+          }])
+          .select();
+        createdOrder = ordData?.[0] || null;
+      }
+    } catch (ordErr) {
+      console.warn('[Checkout Order Log Notice]:', ordErr.message);
     }
 
     const isValidUrl = (url) => {
@@ -353,7 +398,7 @@ router.post('/create-checkout-session', async (req, res) => {
         after_completion: {
           type: 'redirect',
           redirect: {
-            url: `${frontendUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
+            url: `${frontendUrl}/success?session_id={CHECKOUT_SESSION_ID}&order_code=${orderCode}`,
           },
         },
         billing_address_collection: 'required', // Bắt buộc nhập địa chỉ & ZIP để qua AVS của ngân hàng
@@ -364,6 +409,8 @@ router.post('/create-checkout-session', async (req, res) => {
           book_ids: bookIds,
           site_id: targetSite || 'all',
           account_name: accountName,
+          order_code: orderCode,
+          order_id: createdOrder?.id || orderCode
         },
       };
 
@@ -406,17 +453,19 @@ router.post('/create-checkout-session', async (req, res) => {
         phone_number_collection: {
           enabled: true,
         },
-        success_url: `${frontendUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
+        success_url: `${frontendUrl}/success?session_id={CHECKOUT_SESSION_ID}&order_code=${orderCode}`,
         cancel_url: `${frontendUrl}/cart`,
         metadata: {
           book_ids: bookIds,
           site_id: targetSite || 'all',
           account_name: accountName,
+          order_code: orderCode,
+          order_id: createdOrder?.id || orderCode
         },
       };
 
-      if (customer_email) {
-        sessionParams.customer_email = customer_email;
+      if (targetEmail) {
+        sessionParams.customer_email = targetEmail;
       }
 
       let session;
@@ -438,7 +487,12 @@ router.post('/create-checkout-session', async (req, res) => {
       returnUrl = session.url;
     }
 
-    res.json({ id: returnId, url: returnUrl });
+    res.json({ 
+      id: returnId, 
+      url: returnUrl,
+      orderCode: orderCode,
+      orderId: createdOrder?.id || orderCode
+    });
   } catch (error) {
     console.error('Stripe checkout error:', error);
     res.status(500).json({ 
@@ -803,7 +857,7 @@ router.delete('/paypal-settings/:id', async (req, res) => {
 // 6. Create PayPal Order
 router.post('/paypal/create-order', async (req, res) => {
   try {
-    const { items, site_id, site, customer_email } = req.body;
+    const { items, site_id, site, customer_email, email, customer_name, first_name, last_name } = req.body;
     const targetSite = site_id || site;
     const { clientId, clientSecret, mode, accountName, siteId: resolvedSiteId } = await getPayPalCredentials(targetSite);
 
@@ -812,6 +866,19 @@ router.post('/paypal/create-order', async (req, res) => {
     if (!items || !items.length) {
       return res.status(400).json({ error: 'No items provided' });
     }
+
+    // Auto-run background purge for expired pending orders older than 2 days
+    purgeExpiredPendingOrders().catch(() => {});
+
+    // Prepare Customer Info & Pending Order
+    const targetEmail = (customer_email || email || '').trim();
+    let fullName = customer_name ? customer_name.trim() : '';
+    if (!fullName && (first_name || last_name)) {
+      fullName = `${first_name || ''} ${last_name || ''}`.trim();
+    }
+    if (!fullName && targetEmail) fullName = targetEmail.split('@')[0];
+
+    const orderCode = generateOrderCode();
 
     const { accessToken, baseUrl } = await getPayPalAccessToken(clientId, clientSecret, mode);
 
@@ -842,13 +909,37 @@ router.post('/paypal/create-order', async (req, res) => {
 
     const totalValueStr = totalAmount.toFixed(2);
 
+    let createdOrder = null;
+    try {
+      if (targetEmail) {
+        const { data: ordData } = await supabase
+          .from('orders')
+          .insert([{
+            order_code: orderCode,
+            site_id: (targetSite || 'bookpatr').toLowerCase().trim(),
+            customer_name: fullName || 'Valued Customer',
+            customer_email: targetEmail,
+            items: items,
+            total_amount: parseFloat(totalAmount.toFixed(2)),
+            currency: 'USD',
+            payment_method: 'paypal',
+            status: 'pending',
+            expires_at: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
+          }])
+          .select();
+        createdOrder = ordData?.[0] || null;
+      }
+    } catch (ordErr) {
+      console.warn('[Checkout PayPal Order Log Notice]:', ordErr.message);
+    }
+
     const orderPayload = {
       intent: 'CAPTURE',
       purchase_units: [
         {
           reference_id: (targetSite || 'bookpatr').substring(0, 250),
           description: `Digital E-Book Purchase (${items.length} items)`,
-          custom_id: bookIds,
+          custom_id: `${orderCode}:${bookIds}`,
           amount: {
             currency_code: 'USD',
             value: totalValueStr,
@@ -867,15 +958,21 @@ router.post('/paypal/create-order', async (req, res) => {
         landing_page: 'BILLING',
         shipping_preference: 'NO_SHIPPING',
         user_action: 'PAY_NOW',
-        return_url: `${frontendUrl}/success?provider=paypal&site_id=${targetSite || 'all'}`,
+        return_url: `${frontendUrl}/success?provider=paypal&site_id=${targetSite || 'all'}&order_code=${orderCode}`,
         cancel_url: `${frontendUrl}/cart`
       }
     };
 
-    if (customer_email) {
+    if (targetEmail) {
       orderPayload.payer = {
-        email_address: customer_email
+        email_address: targetEmail
       };
+      if (first_name || last_name) {
+        orderPayload.payer.name = {
+          given_name: first_name || fullName,
+          surname: last_name || ''
+        };
+      }
     }
 
     const orderResponse = await fetch(`${baseUrl}/v2/checkout/orders`, {
@@ -902,6 +999,8 @@ router.post('/paypal/create-order', async (req, res) => {
       orderId: orderData.id,
       url: approveLink ? approveLink.href : null,
       approvalUrl: approveLink ? approveLink.href : null,
+      orderCode: orderCode,
+      dbOrderId: createdOrder?.id || orderCode,
       status: orderData.status
     });
   } catch (error) {
@@ -1034,8 +1133,37 @@ router.get('/session/:id', async (req, res) => {
 
           if (orderData && (orderData.status === 'COMPLETED' || orderData.status === 'APPROVED')) {
             const unit = orderData.purchase_units && orderData.purchase_units[0];
-            const customId = unit?.custom_id || (unit?.payments?.captures && unit.payments.captures[0]?.custom_id);
-            const bookIds = customId ? customId.split(',') : [];
+            const customId = unit?.custom_id || (unit?.payments?.captures && unit.payments.captures[0]?.custom_id) || '';
+            
+            // Extract orderCode and bookIds if formatted as orderCode:bookId1,bookId2
+            let orderCode = null;
+            let bookIds = [];
+            if (customId.includes(':')) {
+              const parts = customId.split(':');
+              orderCode = parts[0];
+              bookIds = parts[1] ? parts[1].split(',') : [];
+            } else {
+              bookIds = customId ? customId.split(',') : [];
+            }
+
+            // Mark order as completed in database
+            try {
+              if (orderCode) {
+                await supabase.from('orders').update({
+                  status: 'completed',
+                  payment_id: orderOrSessionId,
+                  updated_at: new Date().toISOString()
+                }).eq('order_code', orderCode);
+              } else {
+                await supabase.from('orders').update({
+                  status: 'completed',
+                  payment_id: orderOrSessionId,
+                  updated_at: new Date().toISOString()
+                }).eq('payment_id', orderOrSessionId);
+              }
+            } catch (ordUpdateErr) {
+              console.warn('[Order Complete Notice]:', ordUpdateErr.message);
+            }
 
             const { data: books, error } = await supabase
               .from('books')
@@ -1043,7 +1171,7 @@ router.get('/session/:id', async (req, res) => {
               .in('id', bookIds);
 
             if (!error && books) {
-              return res.json({ books, provider: 'paypal', order: orderData });
+              return res.json({ books, provider: 'paypal', order: orderData, orderCode });
             }
           }
         }
@@ -1089,6 +1217,27 @@ router.get('/session/:id', async (req, res) => {
     }
 
     const bookIds = session.metadata?.book_ids ? session.metadata.book_ids.split(',') : [];
+    const orderCode = session.metadata?.order_code || null;
+    const orderId = session.metadata?.order_id || null;
+
+    // Mark order as completed in database
+    try {
+      if (orderCode) {
+        await supabase.from('orders').update({
+          status: 'completed',
+          payment_id: session.id,
+          updated_at: new Date().toISOString()
+        }).eq('order_code', orderCode);
+      } else if (orderId) {
+        await supabase.from('orders').update({
+          status: 'completed',
+          payment_id: session.id,
+          updated_at: new Date().toISOString()
+        }).eq('id', orderId);
+      }
+    } catch (ordUpdateErr) {
+      console.warn('[Stripe Order Complete Notice]:', ordUpdateErr.message);
+    }
 
     const { data: books, error } = await supabase
       .from('books')
@@ -1097,7 +1246,7 @@ router.get('/session/:id', async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ books: books || [], provider: 'stripe' });
+    res.json({ books: books || [], provider: 'stripe', orderCode });
   } catch (error) {
     console.error('Error retrieving session:', error);
     res.status(500).json({ error: error.message });
