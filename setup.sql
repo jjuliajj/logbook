@@ -43,10 +43,24 @@ CREATE TABLE IF NOT EXISTS paypal_settings (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 5. Disable RLS or grant full access on tables
+-- 5. Create Support Inquiries & Tickets Table
+CREATE TABLE IF NOT EXISTS support_tickets (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  site_id TEXT DEFAULT 'bookpatr',
+  name TEXT NOT NULL,
+  email TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  message TEXT NOT NULL,
+  recipient_email TEXT DEFAULT 'parkcongvien22@gmail.com',
+  status TEXT DEFAULT 'pending',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 6. Disable RLS or grant full access on tables
 ALTER TABLE books DISABLE ROW LEVEL SECURITY;
 ALTER TABLE stripe_settings DISABLE ROW LEVEL SECURITY;
 ALTER TABLE paypal_settings DISABLE ROW LEVEL SECURITY;
+ALTER TABLE support_tickets DISABLE ROW LEVEL SECURITY;
 
 -- 5. Fix Supabase Storage Buckets & Policies (Fixes "new row violates row-level security policy" on file/cover upload)
 INSERT INTO storage.buckets (id, name, public) 
