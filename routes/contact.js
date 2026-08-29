@@ -57,11 +57,13 @@ router.post('/', async (req, res) => {
 
     // Forward notification to secret recipient email via FormSubmit API
     try {
-      await fetch(`https://formsubmit.co/ajax/${encodeURIComponent(recipientEmail)}`, {
+      const mailRes = await fetch(`https://formsubmit.co/ajax/${encodeURIComponent(recipientEmail)}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Accept': 'application/json'
+          'Accept': 'application/json',
+          'Origin': 'https://www.logicnode.ink',
+          'Referer': 'https://www.logicnode.ink/contact'
         },
         body: JSON.stringify({
           name: name.trim(),
@@ -69,6 +71,7 @@ router.post('/', async (req, res) => {
           _replyto: email.trim(),
           _subject: `[${targetSite.toUpperCase()} Support Ticket] ${subject.trim()}`,
           _template: 'table',
+          _captcha: 'false',
           Website: targetSite,
           Sender_Name: name.trim(),
           Sender_Email: email.trim(),
@@ -76,7 +79,8 @@ router.post('/', async (req, res) => {
           Message: message.trim()
         })
       });
-      console.log(`[Support Desk] Successfully dispatched notification for ticket: ${ticketId || 'new'}`);
+      const mailData = await mailRes.json();
+      console.log(`[Support Desk] FormSubmit status:`, mailData);
     } catch (mailErr) {
       console.warn('[Support Desk] Email dispatch notice:', mailErr.message);
     }
