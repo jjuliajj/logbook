@@ -448,18 +448,582 @@ router.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-// 6. Retrieve session details
-router.get('/session/:id', async (req, res) => {
+// Helper to parse and extract site_id and clean display name from a paypal setting
+function parsePayPalSetting(r) {
+  if (!r) return null;
+  let site_id = r.site_id;
+  let cleanName = r.account_name || '';
+
+  // Extract [site_id] prefix from account_name if present
+  const match = r.account_name && r.account_name.match(/^\[([a-zA-Z0-9_\-]+)\]\s*(.*)$/);
+  if (match) {
+    site_id = match[1];
+    cleanName = match[2] || r.account_name;
+  } else if (!site_id) {
+    site_id = 'bookpatr';
+  }
+
+  return {
+    ...r,
+    site_id: (site_id || 'bookpatr').toLowerCase().trim(),
+    account_name: cleanName,
+    raw_account_name: r.account_name,
+    mode: (r.mode || 'live').toLowerCase().trim(),
+  };
+}
+
+// Helper to get active PayPal credentials dynamically from DB per site or fallback to global / .env
+async function getPayPalCredentials(siteId) {
+  const targetSite = siteId && siteId !== 'all' ? siteId.toLowerCase().trim() : null;
+
+  try {
+    const { data: allSettings, error } = await supabase
+      .from('paypal_settings')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (!error && allSettings && allSettings.length > 0) {
+      const parsedSettings = allSettings.map(parsePayPalSetting);
+      const activeSettings = parsedSettings.filter(s => s.is_active && s.client_id && s.client_secret);
+
+      // 1. Try to find active PayPal account configured specifically for this site
+      if (targetSite) {
+        const siteSetting = activeSettings.find(s => s.site_id === targetSite);
+        if (siteSetting) {
+          return {
+            clientId: siteSetting.client_id,
+            clientSecret: siteSetting.client_secret,
+            mode: siteSetting.mode || 'live',
+            accountName: siteSetting.account_name,
+            siteId: targetSite
+          };
+        }
+      }
+
+      // 2. Fallback to active global PayPal account (site_id = 'all')
+      const globalSetting = activeSettings.find(s => s.site_id === 'all');
+      if (globalSetting) {
+        return {
+          clientId: globalSetting.client_id,
+          clientSecret: globalSetting.client_secret,
+          mode: globalSetting.mode || 'live',
+          accountName: globalSetting.account_name,
+          siteId: 'all'
+        };
+      }
+    }
+  } catch (err) {
+    console.log('PayPal DB query fallback to env:', err.message);
+  }
+
+  // 3. Fallback to .env variables
+  return {
+    clientId: process.env.PAYPAL_CLIENT_ID || '',
+    clientSecret: process.env.PAYPAL_CLIENT_SECRET || '',
+    mode: (process.env.PAYPAL_MODE || 'live').toLowerCase().trim(),
+    accountName: 'Default (.env)',
+    siteId: 'env'
+  };
+}
+
+// Helper to get PayPal OAuth2 Access Token
+async function getPayPalAccessToken(clientId, clientSecret, mode) {
+  if (!clientId || !clientSecret) {
+    throw new Error('PayPal Client ID and Client Secret are required.');
+  }
+
+  const baseUrl = mode === 'sandbox' ? 'https://api-m.sandbox.paypal.com' : 'https://api-m.paypal.com';
+  const authHeader = Buffer.from(`${clientId.trim()}:${clientSecret.trim()}`).toString('base64');
+
+  const response = await fetch(`${baseUrl}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${authHeader}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'grant_type=client_credentials'
+  });
+
+  const data = await response.json();
+  if (!response.ok || !data.access_token) {
+    throw new Error(data.error_description || data.message || 'Failed to authenticate with PayPal API');
+  }
+
+  return {
+    accessToken: data.access_token,
+    baseUrl
+  };
+}
+
+// ==========================================
+// PAYPAL SETTINGS CRUD ENDPOINTS
+// ==========================================
+
+// 1. Get all PayPal account settings (optionally filtered by ?site=...)
+router.get('/paypal-settings', async (req, res) => {
   try {
     const { site, site_id } = req.query;
-    const targetSite = site || site_id;
-    const { stripe } = await getStripeClient(targetSite);
+    const targetSite = (site || site_id)?.toLowerCase().trim();
 
+    const { data, error } = await supabase
+      .from('paypal_settings')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    let settings = (data || []).map(parsePayPalSetting);
+
+    if (targetSite && targetSite !== 'all') {
+      settings = settings.filter(s => s.site_id === 'all' || s.site_id === targetSite);
+    }
+
+    res.json(settings);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 2. Add new PayPal account setting for a specific site
+router.post('/paypal-settings', async (req, res) => {
+  try {
+    const { account_name, client_id, client_secret, mode, is_active, site_id, site } = req.body;
+    const targetSite = (site_id || site || 'all').toLowerCase().trim();
+
+    if (!account_name || !client_id || !client_secret) {
+      return res.status(400).json({ error: 'Account Name, Client ID, and Client Secret are required.' });
+    }
+
+    const cleanName = account_name.replace(/^\[[a-zA-Z0-9_\-]+\]\s*/, '').trim();
+    const formattedAccountName = `[${targetSite}] ${cleanName}`;
+
+    // If activating this account, deactivate OTHER accounts belonging to this specific site only!
+    if (is_active) {
+      const { data: allData } = await supabase.from('paypal_settings').select('*');
+      if (allData) {
+        const toDeactivate = allData
+          .map(parsePayPalSetting)
+          .filter(s => s.site_id === targetSite && s.is_active)
+          .map(s => s.id);
+        if (toDeactivate.length > 0) {
+          await supabase.from('paypal_settings').update({ is_active: false }).in('id', toDeactivate);
+        }
+      }
+    }
+
+    const insertPayload = {
+      account_name: formattedAccountName,
+      client_id: client_id.trim(),
+      client_secret: client_secret.trim(),
+      mode: (mode || 'live').toLowerCase().trim(),
+      is_active: Boolean(is_active)
+    };
+
+    let insertedSetting = null;
+    try {
+      const { data, error } = await supabase
+        .from('paypal_settings')
+        .insert([{ ...insertPayload, site_id: targetSite }])
+        .select();
+      if (error) throw error;
+      insertedSetting = data;
+    } catch {
+      const { data, error } = await supabase
+        .from('paypal_settings')
+        .insert([insertPayload])
+        .select();
+      if (error) throw error;
+      insertedSetting = data;
+    }
+
+    res.status(201).json(parsePayPalSetting(insertedSetting[0]));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 3. Activate a PayPal account for its specific site
+router.put('/paypal-settings/:id/activate', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { site_id, site } = req.body || {};
+
+    const { data: targetRecord, error: findErr } = await supabase
+      .from('paypal_settings')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (findErr || !targetRecord) {
+      return res.status(404).json({ error: 'PayPal configuration not found' });
+    }
+
+    const parsed = parsePayPalSetting(targetRecord);
+    const targetSite = (site_id || site || parsed.site_id || 'all').toLowerCase().trim();
+
+    // Deactivate other accounts belonging to this site only
+    const { data: allData } = await supabase.from('paypal_settings').select('*');
+    if (allData) {
+      const toDeactivate = allData
+        .map(parsePayPalSetting)
+        .filter(s => s.id !== id && s.site_id === targetSite && s.is_active)
+        .map(s => s.id);
+      if (toDeactivate.length > 0) {
+        await supabase.from('paypal_settings').update({ is_active: false }).in('id', toDeactivate);
+      }
+    }
+
+    // Activate selected account
+    const { data, error } = await supabase
+      .from('paypal_settings')
+      .update({ is_active: true })
+      .eq('id', id)
+      .select();
+
+    if (error) throw error;
+    res.json(parsePayPalSetting(data[0]));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 4. Update a PayPal account configuration
+router.put('/paypal-settings/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { account_name, client_id, client_secret, mode, is_active, site_id, site } = req.body;
+
+    const { data: currentRecord } = await supabase.from('paypal_settings').select('*').eq('id', id).single();
+    const currentParsed = parsePayPalSetting(currentRecord);
+
+    const targetSite = (site_id || site || currentParsed?.site_id || 'all').toLowerCase().trim();
+    const cleanName = (account_name !== undefined ? account_name : currentParsed?.account_name || '')
+      .replace(/^\[[a-zA-Z0-9_\-]+\]\s*/, '').trim();
+    const formattedAccountName = `[${targetSite}] ${cleanName}`;
+
+    const updateFields = {
+      account_name: formattedAccountName
+    };
+    if (client_id !== undefined) updateFields.client_id = client_id.trim();
+    if (client_secret !== undefined) updateFields.client_secret = client_secret.trim();
+    if (mode !== undefined) updateFields.mode = mode.toLowerCase().trim();
+    if (is_active !== undefined) updateFields.is_active = is_active;
+
+    if (is_active) {
+      const { data: allData } = await supabase.from('paypal_settings').select('*');
+      if (allData) {
+        const toDeactivate = allData
+          .map(parsePayPalSetting)
+          .filter(s => s.id !== id && s.site_id === targetSite && s.is_active)
+          .map(s => s.id);
+        if (toDeactivate.length > 0) {
+          await supabase.from('paypal_settings').update({ is_active: false }).in('id', toDeactivate);
+        }
+      }
+    }
+
+    let updatedData = null;
+    try {
+      const { data, error } = await supabase
+        .from('paypal_settings')
+        .update({ ...updateFields, site_id: targetSite })
+        .eq('id', id)
+        .select();
+      if (error) throw error;
+      updatedData = data;
+    } catch {
+      const { data, error } = await supabase
+        .from('paypal_settings')
+        .update(updateFields)
+        .eq('id', id)
+        .select();
+      if (error) throw error;
+      updatedData = data;
+    }
+
+    res.json(parsePayPalSetting(updatedData[0]));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 5. Delete a PayPal account setting
+router.delete('/paypal-settings/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase
+      .from('paypal_settings')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+    res.json({ message: 'PayPal configuration deleted' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==========================================
+// PAYPAL CHECKOUT FLOW ENDPOINTS
+// ==========================================
+
+// 6. Create PayPal Order
+router.post('/paypal/create-order', async (req, res) => {
+  try {
+    const { items, site_id, site, customer_email } = req.body;
+    const targetSite = site_id || site;
+    const { clientId, clientSecret, mode, accountName, siteId: resolvedSiteId } = await getPayPalCredentials(targetSite);
+
+    console.log(`[PayPal Checkout] Creating order for site: "${targetSite}" -> Using PayPal Gateway: "${accountName}" (Mode: ${mode}, Site ID: "${resolvedSiteId}")`);
+
+    if (!items || !items.length) {
+      return res.status(400).json({ error: 'No items provided' });
+    }
+
+    const { accessToken, baseUrl } = await getPayPalAccessToken(clientId, clientSecret, mode);
+
+    const bookIds = items.map(item => item.id).join(',');
+    let origin = req.headers.origin || (req.headers.referer ? new URL(req.headers.referer).origin : null);
+    const rawFrontendUrl = process.env.FRONTEND_URL || origin || 'https://bookpatr.vercel.app';
+    const frontendUrl = rawFrontendUrl.replace(/\/$/, '');
+
+    // Calculate itemized pricing
+    let totalAmount = 0;
+    const lineItems = items.map(item => {
+      const rawPrice = String(item.price || '0.50').replace(/[^0-9.]/g, '');
+      let numericPrice = parseFloat(rawPrice) || 0.50;
+      if (numericPrice < 0.50) numericPrice = 0.50;
+      const qty = parseInt(item.quantity, 10) || 1;
+      totalAmount += numericPrice * qty;
+
+      return {
+        name: (item.title || 'Digital E-Book').substring(0, 127),
+        unit_amount: {
+          currency_code: 'USD',
+          value: numericPrice.toFixed(2),
+        },
+        quantity: String(qty),
+        category: 'DIGITAL_GOODS'
+      };
+    });
+
+    const totalValueStr = totalAmount.toFixed(2);
+
+    const orderPayload = {
+      intent: 'CAPTURE',
+      purchase_units: [
+        {
+          reference_id: (targetSite || 'bookpatr').substring(0, 250),
+          description: `Digital E-Book Purchase (${items.length} items)`,
+          custom_id: bookIds,
+          amount: {
+            currency_code: 'USD',
+            value: totalValueStr,
+            breakdown: {
+              item_total: {
+                currency_code: 'USD',
+                value: totalValueStr
+              }
+            }
+          },
+          items: lineItems
+        }
+      ],
+      application_context: {
+        brand_name: targetSite ? targetSite.toUpperCase() : 'E-Book Store',
+        landing_page: 'NO_PREFERENCE',
+        user_action: 'PAY_NOW',
+        return_url: `${frontendUrl}/success?provider=paypal&site_id=${targetSite || 'all'}`,
+        cancel_url: `${frontendUrl}/cart`
+      }
+    };
+
+    if (customer_email) {
+      orderPayload.payer = {
+        email_address: customer_email
+      };
+    }
+
+    const orderResponse = await fetch(`${baseUrl}/v2/checkout/orders`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation'
+      },
+      body: JSON.stringify(orderPayload)
+    });
+
+    const orderData = await orderResponse.json();
+
+    if (!orderResponse.ok) {
+      console.error('[PayPal Order Create Error]:', orderData);
+      throw new Error(orderData.message || (orderData.details && orderData.details[0]?.description) || 'Failed to create PayPal order');
+    }
+
+    const approveLink = (orderData.links || []).find(l => l.rel === 'approve' || l.rel === 'payer-action');
+
+    res.json({
+      id: orderData.id,
+      orderId: orderData.id,
+      url: approveLink ? approveLink.href : null,
+      approvalUrl: approveLink ? approveLink.href : null,
+      status: orderData.status
+    });
+  } catch (error) {
+    console.error('PayPal create order error:', error);
+    res.status(500).json({
+      error: 'The PayPal payment gateway is temporarily initializing. Please try again in a few moments.',
+      details: error.message
+    });
+  }
+});
+
+// 7. Capture PayPal Order upon customer return
+router.post('/paypal/capture-order', async (req, res) => {
+  try {
+    const { orderId, order_id, token, site, site_id } = req.body;
+    const targetOrderId = orderId || order_id || token;
+    const targetSite = site || site_id;
+
+    if (!targetOrderId) {
+      return res.status(400).json({ error: 'Order ID / Token is required to capture PayPal payment' });
+    }
+
+    const { clientId, clientSecret, mode } = await getPayPalCredentials(targetSite);
+    const { accessToken, baseUrl } = await getPayPalAccessToken(clientId, clientSecret, mode);
+
+    // 1. Capture order on PayPal
+    let captureResponse = await fetch(`${baseUrl}/v2/checkout/orders/${targetOrderId}/capture`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation'
+      }
+    });
+
+    let captureData = await captureResponse.json();
+
+    // If order was already captured or is completed, fetch order details directly
+    if (!captureResponse.ok) {
+      const isAlreadyCaptured = captureData.details && captureData.details.some(d => d.issue === 'ORDER_ALREADY_CAPTURED');
+      if (isAlreadyCaptured || captureResponse.status === 422) {
+        const getOrderRes = await fetch(`${baseUrl}/v2/checkout/orders/${targetOrderId}`, {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          }
+        });
+        if (getOrderRes.ok) {
+          captureData = await getOrderRes.json();
+        }
+      } else {
+        console.error('[PayPal Capture Error]:', captureData);
+        throw new Error(captureData.message || (captureData.details && captureData.details[0]?.description) || 'Failed to capture PayPal payment');
+      }
+    }
+
+    const isPaid = captureData.status === 'COMPLETED' || captureData.status === 'APPROVED';
+    if (!isPaid) {
+      return res.status(400).json({ error: `Payment not completed (Status: ${captureData.status})`, order: captureData });
+    }
+
+    // Extract book IDs from purchase units custom_id
+    const unit = captureData.purchase_units && captureData.purchase_units[0];
+    const customId = unit?.custom_id || (unit?.payments?.captures && unit.payments.captures[0]?.custom_id);
+    const bookIds = customId ? customId.split(',') : [];
+
+    let books = [];
+    if (bookIds.length > 0) {
+      const { data: foundBooks, error: booksErr } = await supabase
+        .from('books')
+        .select('id, title, file_url, cover_url')
+        .in('id', bookIds);
+
+      if (!booksErr && foundBooks) {
+        books = foundBooks;
+      }
+    }
+
+    res.json({
+      status: 'COMPLETED',
+      orderId: targetOrderId,
+      books,
+      payer: captureData.payer || null
+    });
+  } catch (error) {
+    console.error('PayPal capture error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 8. Retrieve session details (Unified for Stripe Checkout Sessions & PayPal Orders)
+router.get('/session/:id', async (req, res) => {
+  try {
+    const { site, site_id, provider } = req.query;
+    const targetSite = site || site_id;
+    const orderOrSessionId = req.params.id;
+
+    // --- CASE A: Explicit PayPal Provider or PayPal Order ID format ---
+    if (provider === 'paypal' || (!orderOrSessionId.startsWith('cs_') && !orderOrSessionId.startsWith('plink_'))) {
+      try {
+        const { clientId, clientSecret, mode } = await getPayPalCredentials(targetSite);
+        if (clientId && clientSecret) {
+          const { accessToken, baseUrl } = await getPayPalAccessToken(clientId, clientSecret, mode);
+          
+          // First attempt capture if not yet captured
+          let orderData = null;
+          const captureRes = await fetch(`${baseUrl}/v2/checkout/orders/${orderOrSessionId}/capture`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'application/json'
+            }
+          });
+
+          if (captureRes.ok) {
+            orderData = await captureRes.json();
+          } else {
+            const getRes = await fetch(`${baseUrl}/v2/checkout/orders/${orderOrSessionId}`, {
+              method: 'GET',
+              headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+              }
+            });
+            if (getRes.ok) {
+              orderData = await getRes.json();
+            }
+          }
+
+          if (orderData && (orderData.status === 'COMPLETED' || orderData.status === 'APPROVED')) {
+            const unit = orderData.purchase_units && orderData.purchase_units[0];
+            const customId = unit?.custom_id || (unit?.payments?.captures && unit.payments.captures[0]?.custom_id);
+            const bookIds = customId ? customId.split(',') : [];
+
+            const { data: books, error } = await supabase
+              .from('books')
+              .select('id, title, file_url, cover_url')
+              .in('id', bookIds);
+
+            if (!error && books) {
+              return res.json({ books, provider: 'paypal', order: orderData });
+            }
+          }
+        }
+      } catch (paypalErr) {
+        console.warn('PayPal lookup in /session/:id had issue, falling back to Stripe lookup:', paypalErr.message);
+      }
+    }
+
+    // --- CASE B: Stripe Session Lookup ---
+    const { stripe } = await getStripeClient(targetSite);
     let session = null;
 
     // 1. Try retrieving with targeted Stripe client
     try {
-      session = await stripe.checkout.sessions.retrieve(req.params.id);
+      session = await stripe.checkout.sessions.retrieve(orderOrSessionId);
     } catch (sessionErr) {
       console.warn(`Could not retrieve session with primary client (${sessionErr.message}), searching other active Stripe accounts...`);
       
@@ -470,7 +1034,7 @@ router.get('/session/:id', async (req, res) => {
           if (setting.secret_key && setting.is_active) {
             try {
               const tempStripe = new Stripe(setting.secret_key);
-              const foundSession = await tempStripe.checkout.sessions.retrieve(req.params.id);
+              const foundSession = await tempStripe.checkout.sessions.retrieve(orderOrSessionId);
               if (foundSession) {
                 session = foundSession;
                 break;
@@ -498,7 +1062,7 @@ router.get('/session/:id', async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ books: books || [] });
+    res.json({ books: books || [], provider: 'stripe' });
   } catch (error) {
     console.error('Error retrieving session:', error);
     res.status(500).json({ error: error.message });
