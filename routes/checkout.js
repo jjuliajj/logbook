@@ -424,12 +424,12 @@ router.post('/create-checkout-session', async (req, res) => {
         session = await stripe.checkout.sessions.create(sessionParams);
       } catch (sessErr) {
         console.warn('Standard session creation failed, retrying with managed_payments disabled:', sessErr.message);
-        if (sessErr.message && (sessErr.message.includes('managed_payments') || sessErr.message.includes('tax'))) {
+        try {
           session = await stripe.checkout.sessions.create({
             ...sessionParams,
             managed_payments: { enabled: false }
           });
-        } else {
+        } catch (retryErr) {
           throw sessErr;
         }
       }
@@ -442,7 +442,7 @@ router.post('/create-checkout-session', async (req, res) => {
   } catch (error) {
     console.error('Stripe checkout error:', error);
     res.status(500).json({ 
-      error: 'The payment gateway is temporarily initializing. Please try again in a few moments.',
+      error: error.message || 'The payment gateway is temporarily initializing. Please try again in a few moments.',
       details: error.message 
     });
   }
