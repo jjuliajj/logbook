@@ -526,16 +526,48 @@ async function getPayPalCredentials(siteId) {
   };
 }
 
-// Helper to get PayPal OAuth2 Access Token
+// Helper to get PayPal OAuth2 Access Token with smart auto-detection (Sandbox / Live)
 async function getPayPalAccessToken(clientId, clientSecret, mode) {
   if (!clientId || !clientSecret) {
     throw new Error('PayPal Client ID and Client Secret are required.');
   }
 
-  const baseUrl = mode === 'sandbox' ? 'https://api-m.sandbox.paypal.com' : 'https://api-m.paypal.com';
+  const primaryMode = (mode || 'live').toLowerCase().trim();
+  const primaryBaseUrl = primaryMode === 'sandbox' ? 'https://api-m.sandbox.paypal.com' : 'https://api-m.paypal.com';
   const authHeader = Buffer.from(`${clientId.trim()}:${clientSecret.trim()}`).toString('base64');
 
-  const response = await fetch(`${baseUrl}/v1/oauth2/token`, {
+  // 1. Try primary configured mode
+  try {
+    const response = await fetch(`${primaryBaseUrl}/v1/oauth2/token`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${authHeader}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'grant_type=client_credentials'
+    });
+
+    const data = await response.json();
+    if (response.ok && data.access_token) {
+      return {
+        accessToken: data.access_token,
+        baseUrl: primaryBaseUrl,
+        resolvedMode: primaryMode
+      };
+    }
+
+    console.warn(`[PayPal Auth] Primary mode (${primaryMode}) failed:`, data.error_description || data.message || data.error);
+  } catch (err) {
+    console.warn(`[PayPal Auth] Network error on primary mode (${primaryMode}):`, err.message);
+  }
+
+  // 2. Auto-fallback to alternate mode (e.g. if user entered Sandbox keys under Live mode or vice versa)
+  const altMode = primaryMode === 'sandbox' ? 'live' : 'sandbox';
+  const altBaseUrl = altMode === 'sandbox' ? 'https://api-m.sandbox.paypal.com' : 'https://api-m.paypal.com';
+
+  console.log(`[PayPal Auth] Attempting auto-detection with alternate mode: ${altMode}...`);
+
+  const altResponse = await fetch(`${altBaseUrl}/v1/oauth2/token`, {
     method: 'POST',
     headers: {
       'Authorization': `Basic ${authHeader}`,
@@ -544,15 +576,17 @@ async function getPayPalAccessToken(clientId, clientSecret, mode) {
     body: 'grant_type=client_credentials'
   });
 
-  const data = await response.json();
-  if (!response.ok || !data.access_token) {
-    throw new Error(data.error_description || data.message || 'Failed to authenticate with PayPal API');
+  const altData = await altResponse.json();
+  if (altResponse.ok && altData.access_token) {
+    console.log(`[PayPal Auth] Auto-detection SUCCESS: Keys belong to ${altMode.toUpperCase()} environment.`);
+    return {
+      accessToken: altData.access_token,
+      baseUrl: altBaseUrl,
+      resolvedMode: altMode
+    };
   }
 
-  return {
-    accessToken: data.access_token,
-    baseUrl
-  };
+  throw new Error(altData.error_description || altData.message || 'Client Authentication failed. Please check your PayPal Client ID and Client Secret.');
 }
 
 // ==========================================
