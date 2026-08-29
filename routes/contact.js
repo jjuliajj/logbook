@@ -57,6 +57,9 @@ router.post('/', async (req, res) => {
 
     // Forward notification to secret recipient email via FormSubmit API
     try {
+      const shortId = ticketId ? ticketId.substring(0, 6) : Date.now().toString().slice(-4);
+      const emailSubject = `[${targetSite.toUpperCase()} #${shortId}] New Inquiry from ${name.trim()}: ${subject.trim()}`;
+
       const mailRes = await fetch(`https://formsubmit.co/ajax/${encodeURIComponent(recipientEmail)}`, {
         method: 'POST',
         headers: {
@@ -66,17 +69,17 @@ router.post('/', async (req, res) => {
           'Referer': 'https://www.logicnode.ink/contact'
         },
         body: JSON.stringify({
-          name: name.trim(),
-          email: email.trim(),
+          _subject: emailSubject,
           _replyto: email.trim(),
-          _subject: `[${targetSite.toUpperCase()} Support Ticket] ${subject.trim()}`,
           _template: 'table',
           _captcha: 'false',
+          Ticket_ID: ticketId || `T-${Date.now()}`,
           Website: targetSite,
-          Sender_Name: name.trim(),
-          Sender_Email: email.trim(),
+          Customer_Name: name.trim(),
+          Customer_Email: email.trim(),
           Subject: subject.trim(),
-          Message: message.trim()
+          Message: message.trim(),
+          Sent_At: new Date().toISOString()
         })
       });
       const mailData = await mailRes.json();
