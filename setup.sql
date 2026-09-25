@@ -78,29 +78,52 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE TABLE IF NOT EXISTS whop_users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   name TEXT NOT NULL,
+  slug TEXT,
+  description TEXT,
   color TEXT DEFAULT '#FF6243',
+  sort_order INTEGER DEFAULT 0,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Ensure color column exists if table was already created
+-- Ensure all user columns exist if table was already created
+ALTER TABLE whop_users ADD COLUMN IF NOT EXISTS slug TEXT;
+ALTER TABLE whop_users ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE whop_users ADD COLUMN IF NOT EXISTS color TEXT DEFAULT '#FF6243';
+ALTER TABLE whop_users ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0;
 
 -- 8. Create Whop Quick-Access Links Table
 CREATE TABLE IF NOT EXISTS whop_links (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID REFERENCES whop_users(id) ON DELETE CASCADE,
-  title TEXT,
+  user_name TEXT,
+  title TEXT NOT NULL,
   url TEXT NOT NULL,
+  price TEXT,
+  category TEXT,
   description TEXT,
   image_url TEXT,
   site_name TEXT,
+  site_id TEXT DEFAULT 'all',
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Ensure preview columns exist if table was already created
+-- Ensure all link columns exist if table was already created
+ALTER TABLE whop_links ADD COLUMN IF NOT EXISTS user_name TEXT;
+ALTER TABLE whop_links ADD COLUMN IF NOT EXISTS price TEXT;
+ALTER TABLE whop_links ADD COLUMN IF NOT EXISTS category TEXT;
 ALTER TABLE whop_links ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE whop_links ADD COLUMN IF NOT EXISTS image_url TEXT;
 ALTER TABLE whop_links ADD COLUMN IF NOT EXISTS site_name TEXT;
+ALTER TABLE whop_links ADD COLUMN IF NOT EXISTS site_id TEXT DEFAULT 'all';
+
+-- Seed default initial Whop users if table is empty
+INSERT INTO whop_users (name, slug, color, sort_order)
+SELECT 'Acc chính đã xác minh', 'acc-chinh', '#FF6243', 1
+WHERE NOT EXISTS (SELECT 1 FROM whop_users);
+
+INSERT INTO whop_users (name, slug, color, sort_order)
+SELECT 'User 2', 'user-2', '#6366F1', 2
+WHERE (SELECT COUNT(*) FROM whop_users) < 2;
 
 -- 9. Disable RLS or grant full access on tables
 ALTER TABLE books DISABLE ROW LEVEL SECURITY;
