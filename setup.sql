@@ -74,14 +74,44 @@ CREATE TABLE IF NOT EXISTS orders (
   expires_at TIMESTAMP WITH TIME ZONE DEFAULT (NOW() + INTERVAL '2 days')
 );
 
--- 7. Disable RLS or grant full access on tables
+-- 7. Create Whop Users / Accounts Table
+CREATE TABLE IF NOT EXISTS whop_users (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  name TEXT NOT NULL,
+  color TEXT DEFAULT '#FF6243',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Ensure color column exists if table was already created
+ALTER TABLE whop_users ADD COLUMN IF NOT EXISTS color TEXT DEFAULT '#FF6243';
+
+-- 8. Create Whop Quick-Access Links Table
+CREATE TABLE IF NOT EXISTS whop_links (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES whop_users(id) ON DELETE CASCADE,
+  title TEXT,
+  url TEXT NOT NULL,
+  description TEXT,
+  image_url TEXT,
+  site_name TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Ensure preview columns exist if table was already created
+ALTER TABLE whop_links ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE whop_links ADD COLUMN IF NOT EXISTS image_url TEXT;
+ALTER TABLE whop_links ADD COLUMN IF NOT EXISTS site_name TEXT;
+
+-- 9. Disable RLS or grant full access on tables
 ALTER TABLE books DISABLE ROW LEVEL SECURITY;
 ALTER TABLE stripe_settings DISABLE ROW LEVEL SECURITY;
 ALTER TABLE paypal_settings DISABLE ROW LEVEL SECURITY;
 ALTER TABLE support_tickets DISABLE ROW LEVEL SECURITY;
 ALTER TABLE orders DISABLE ROW LEVEL SECURITY;
+ALTER TABLE whop_users DISABLE ROW LEVEL SECURITY;
+ALTER TABLE whop_links DISABLE ROW LEVEL SECURITY;
 
--- 8. Auto-cleanup function for expired pending orders (older than 2 days)
+-- 10. Auto-cleanup function for expired pending orders (older than 2 days)
 CREATE OR REPLACE FUNCTION clean_expired_pending_orders()
 RETURNS void AS $$
 BEGIN
@@ -91,7 +121,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- 5. Fix Supabase Storage Buckets & Policies (Fixes "new row violates row-level security policy" on file/cover upload)
+-- 11. Fix Supabase Storage Buckets & Policies (Fixes "new row violates row-level security policy" on file/cover upload)
 INSERT INTO storage.buckets (id, name, public) 
 VALUES ('books', 'books', true) 
 ON CONFLICT (id) DO UPDATE SET public = true;
@@ -120,5 +150,6 @@ CREATE POLICY "Public Upload Covers" ON storage.objects FOR INSERT WITH CHECK (b
 CREATE POLICY "Public Read Covers" ON storage.objects FOR SELECT USING (bucket_id = 'covers');
 CREATE POLICY "Public Update Covers" ON storage.objects FOR UPDATE USING (bucket_id = 'covers');
 CREATE POLICY "Public Delete Covers" ON storage.objects FOR DELETE USING (bucket_id = 'covers');
+
 
 
