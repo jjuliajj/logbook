@@ -61,6 +61,20 @@ router.get('/users', async (req, res) => {
     }
 
     if (!data || data.length === 0) {
+      // Table exists in Supabase but is empty -> Seed default users so they exist with real UUIDs
+      const defaultToSeed = [
+        { name: 'Acc chính đã xác minh', slug: 'acc-chinh', description: 'Tài khoản chính', color: '#FF6243', sort_order: 1 },
+        { name: 'User 2', slug: 'user-2', description: 'Tài khoản phụ', color: '#6366F1', sort_order: 2 }
+      ];
+      try {
+        const { data: seeded, error: seedErr } = await supabase
+          .from('whop_users')
+          .insert(defaultToSeed)
+          .select();
+        if (!seedErr && seeded && seeded.length > 0) {
+          return res.json(seeded);
+        }
+      } catch {}
       return res.json(memoryUsers);
     }
 
@@ -271,21 +285,43 @@ router.post('/links', async (req, res) => {
       formattedUrl = `https://${formattedUrl}`;
     }
 
+    const isUUID = (str) => Boolean(str && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str));
+    let targetUserId = user_id;
+
+    try {
+      const { data: dbUsers } = await supabase.from('whop_users').select('id, name').order('created_at', { ascending: true });
+      if (dbUsers && dbUsers.length > 0) {
+        const matched = dbUsers.find(u => u.id === targetUserId || u.name === user_name);
+        if (matched) {
+          targetUserId = matched.id;
+        } else if (!isUUID(targetUserId)) {
+          targetUserId = dbUsers[0].id;
+        }
+      } else {
+        const { data: newU } = await supabase.from('whop_users').insert([{ name: user_name || 'Acc chính đã xác minh', color: '#FF6243' }]).select();
+        if (newU && newU.length > 0) {
+          targetUserId = newU[0].id;
+        }
+      }
+    } catch (uErr) {
+      console.warn('[Whop Link POST User Lookup] Warning:', uErr.message);
+    }
+
     const newLink = {
-      user_id: user_id || (memoryUsers[0] ? memoryUsers[0].id : null),
-      user_name: user_name || '',
       title: (title || '').trim() || formattedUrl.replace(/^https?:\/\//, '').replace(/\/$/, ''),
       url: formattedUrl,
-      price: price ? price.trim() : '',
-      category: category ? category.trim() : 'Khác',
-      description: description ? description.trim() : '',
-      image_url: image_url ? image_url.trim() : '',
-      site_name: site_name ? site_name.trim() : 'Whop',
-      site_id: site_id || 'all',
-      clicks_count: 0,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      description: (description || '').trim() || null,
+      image_url: (image_url || '').trim() || null,
+      site_name: (site_name || 'Whop').trim() || null,
+      site_id: site_id || 'all'
     };
+
+    if (targetUserId && isUUID(targetUserId)) {
+      newLink.user_id = targetUserId;
+    }
+    if (user_name) newLink.user_name = user_name;
+    if (price) newLink.price = price.trim();
+    if (category) newLink.category = category.trim();
 
     try {
       const { data, error } = await supabase
@@ -295,6 +331,8 @@ router.post('/links', async (req, res) => {
 
       if (!error && data && data.length > 0) {
         return res.status(201).json(data[0]);
+      } else if (error) {
+        console.warn('[Whop Link POST DB Error]:', error.message);
       }
     } catch (dbErr) {
       console.warn('[Whop Link POST DB] Warning:', dbErr.message);
@@ -303,7 +341,9 @@ router.post('/links', async (req, res) => {
     // Memory fallback
     const memLink = {
       id: `whop-link-${Date.now()}`,
-      ...newLink
+      ...newLink,
+      user_id: targetUserId || 'whop-user-1',
+      created_at: new Date().toISOString()
     };
     memoryLinks.unshift(memLink);
     res.status(201).json(memLink);
